@@ -38,6 +38,10 @@ reports/
 validation_reports/
 *.log
 
+# Spark
+spark-warehouse/
+.checkpoint/
+
 # Local config with passwords
 local_config.json
 *-local.json
