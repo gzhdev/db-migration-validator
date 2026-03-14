@@ -1,0 +1,247 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Table Mapping Configuration",
+  "description": "数据库迁移字段映射配置规范",
+  "type": "object",
+  "required": ["version", "source_db", "target_db", "tables"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "配置文件版本",
+      "pattern": "^\\d+\\.\\d+$"
+    },
+    "source_db": {
+      "type": "object",
+      "description": "源数据库连接配置",
+      "required": ["type", "host", "port", "database"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["mysql", "postgresql", "oracle", "sqlserver", "sqlite"],
+          "description": "数据库类型"
+        },
+        "host": { "type": "string", "description": "数据库主机" },
+        "port": { "type": "integer", "description": "数据库端口" },
+        "database": { "type": "string", "description": "数据库名称" },
+        "user": { "type": "string", "description": "用户名" },
+        "password": { "type": "string", "description": "密码（建议使用环境变量）" },
+        "password_env": { "type": "string", "description": "密码环境变量名" }
+      }
+    },
+    "target_db": {
+      "$ref": "#/properties/source_db",
+      "description": "目标数据库连接配置"
+    },
+    "tables": {
+      "type": "array",
+      "description": "表映射配置列表",
+      "items": {
+        "type": "object",
+        "required": ["source_table", "target_table", "field_mappings"],
+        "properties": {
+          "source_table": {
+            "type": "string",
+            "description": "源表名"
+          },
+          "target_table": {
+            "type": "string",
+            "description": "目标表名"
+          },
+          "source_schema": {
+            "type": "string",
+            "description": "源表 schema（如 PostgreSQL 的 schema）"
+          },
+          "target_schema": {
+            "type": "string",
+            "description": "目标表 schema"
+          },
+          "description": {
+            "type": "string",
+            "description": "映射说明"
+          },
+          "field_mappings": {
+            "type": "array",
+            "description": "字段映射配置",
+            "items": {
+              "type": "object",
+              "required": ["target_field"],
+              "oneOf": [
+                { "required": ["source_field"] },
+                { "required": ["transform"] }
+              ],
+              "properties": {
+                "target_field": {
+                  "type": "string",
+                  "description": "目标表字段名"
+                },
+                "source_field": {
+                  "type": "string",
+                  "description": "源表字段名（直接映射时使用）"
+                },
+                "transform": {
+                  "type": "object",
+                  "description": "字段转换配置",
+                  "required": ["type"],
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "concat", "split", "substring", "replace",
+                        "upper", "lower", "trim", "math",
+                        "date_format", "date_add", "coalesce",
+                        "case", "custom", "constant", "json_extract",
+                        "cast", "null_if", "greatest", "least"
+                      ],
+                      "description": "转换类型"
+                    },
+                    "fields": {
+                      "type": "array",
+                      "items": { "type": "string" },
+                      "description": "参与转换的源字段列表"
+                    },
+                    "separator": {
+                      "type": "string",
+                      "description": "concat/split 时的分隔符"
+                    },
+                    "start": {
+                      "type": "integer",
+                      "description": "substring 起始位置（从1开始）"
+                    },
+                    "length": {
+                      "type": "integer",
+                      "description": "substring 长度"
+                    },
+                    "pattern": {
+                      "type": "string",
+                      "description": "replace/regex 的模式"
+                    },
+                    "replacement": {
+                      "type": "string",
+                      "description": "replace 的替换值"
+                    },
+                    "format": {
+                      "type": "string",
+                      "description": "date_format 的格式字符串"
+                    },
+                    "interval": {
+                      "type": "string",
+                      "description": "date_add 的时间间隔，如 '1 day', '-7 days'"
+                    },
+                    "value": {
+                      "description": "constant 或 null_if 的值"
+                    },
+                    "default": {
+                      "description": "coalesce 的默认值"
+                    },
+                    "cases": {
+                      "type": "array",
+                      "description": "case 转换的条件分支",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "when": { "type": "string" },
+                          "then": { "type": "string" }
+                        }
+                      }
+                    },
+                    "else": {
+                      "description": "case 的默认值"
+                    },
+                    "expression": {
+                      "type": "string",
+                      "description": "math/custom 转换的表达式"
+                    },
+                    "cast_type": {
+                      "type": "string",
+                      "enum": ["string", "int", "float", "bool", "date", "datetime"],
+                      "description": "cast 的目标类型"
+                    },
+                    "args": {
+                      "type": "object",
+                      "description": "自定义参数"
+                    }
+                  }
+                },
+                "is_primary_key": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "是否为主键字段"
+                },
+                "nullable": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "是否允许为空"
+                },
+                "compare_rule": {
+                  "type": "string",
+                  "enum": ["exact", "ignore_case", "ignore_whitespace", "numeric_tolerance", "skip"],
+                  "default": "exact",
+                  "description": "比较规则：精确比较、忽略大小写、忽略空白、数值容差、跳过比较"
+                },
+                "tolerance": {
+                  "type": "number",
+                  "description": "数值比较时的容差范围（当 compare_rule=numeric_tolerance 时使用）"
+                },
+                "description": {
+                  "type": "string",
+                  "description": "字段映射说明"
+                }
+              }
+            }
+          },
+          "filters": {
+            "type": "object",
+            "description": "数据过滤条件",
+            "properties": {
+              "source_filter": {
+                "type": "string",
+                "description": "源表过滤条件 SQL WHERE 子句"
+              },
+              "target_filter": {
+                "type": "string",
+                "description": "目标表过滤条件 SQL WHERE 子句"
+              }
+            }
+          },
+          "sample_size": {
+            "type": "integer",
+            "default": 0,
+            "description": "抽样校验数量，0 表示全量校验"
+          },
+          "batch_size": {
+            "type": "integer",
+            "default": 1000,
+            "description": "批量查询大小"
+          }
+        }
+      }
+    },
+    "global_settings": {
+      "type": "object",
+      "description": "全局设置",
+      "properties": {
+        "parallel_workers": {
+          "type": "integer",
+          "default": 4,
+          "description": "并行工作线程数"
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "default": 3600,
+          "description": "超时时间（秒）"
+        },
+        "output_dir": {
+          "type": "string",
+          "default": "./reports",
+          "description": "报告输出目录"
+        },
+        "report_format": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["json", "csv", "html", "markdown"] },
+          "default": ["json", "html"],
+          "description": "报告输出格式"
+        }
+      }
+    }
+  }
+}
