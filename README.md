@@ -118,6 +118,58 @@ export SOURCE_DB_PASSWORD="your_password"
 }
 ```
 
+#### Oracle (使用 python-oracledb)
+
+python-oracledb 支持两种模式：
+
+**Thin 模式（推荐）** - 纯 Python 实现，无需安装 Oracle Client：
+
+```json
+{
+  "type": "oracle",
+  "host": "192.168.1.50",
+  "port": 1521,
+  "service_name": "ORCL",
+  "user": "scott",
+  "password_env": "ORACLE_PASSWORD"
+}
+```
+
+或使用 SID：
+
+```json
+{
+  "type": "oracle",
+  "host": "192.168.1.50",
+  "port": 1521,
+  "sid": "ORCL",
+  "user": "scott",
+  "password_env": "ORACLE_PASSWORD"
+}
+```
+
+**Thick 模式** - 需要 Oracle Client，支持更多特性：
+
+```json
+{
+  "type": "oracle",
+  "host": "192.168.1.50",
+  "port": 1521,
+  "service_name": "ORCL",
+  "user": "scott",
+  "password_env": "ORACLE_PASSWORD",
+  "thick_mode": true,
+  "oracle_client": "/opt/oracle/instantclient_21_1"
+}
+```
+
+| 参数 | 说明 |
+|------|------|
+| `service_name` | Oracle 服务名（推荐） |
+| `sid` | Oracle SID（与 service_name 二选一） |
+| `thick_mode` | 是否启用 Thick 模式，默认 false |
+| `oracle_client` | Oracle Client 库路径（thick_mode=true 时） |
+
 #### SQLite
 
 ```json

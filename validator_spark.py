@@ -100,20 +100,41 @@ class SparkDataValidator:
         """生成 JDBC URL"""
         db_type = db_config.get('type', 'mysql').lower()
         host = db_config['host']
-        port = db_config['port']
-        database = db_config['database']
+        port = db_config.get('port')
+        database = db_config.get('database', '')
         
-        jdbc_urls = {
-            'mysql': f"jdbc:mysql://{host}:{port}/{database}?useSSL=false&serverTimezone=UTC",
-            'postgresql': f"jdbc:postgresql://{host}:{port}/{database}",
-            'oracle': f"jdbc:oracle:thin:@{host}:{port}:{database}",
-            'sqlserver': f"jdbc:sqlserver://{host}:{port};databaseName={database}",
-        }
+        if db_type == 'mysql':
+            port = port or 3306
+            return f"jdbc:mysql://{host}:{port}/{database}?useSSL=false&serverTimezone=UTC"
         
-        if db_type not in jdbc_urls:
+        elif db_type == 'postgresql':
+            port = port or 5432
+            return f"jdbc:postgresql://{host}:{port}/{database}"
+        
+        elif db_type == 'oracle':
+            port = port or 1521
+            service_name = db_config.get('service_name')
+            sid = db_config.get('sid')
+            
+            if service_name:
+                # 使用 service_name 格式
+                return f"jdbc:oracle:thin:@//{host}:{port}/{service_name}"
+            elif sid:
+                # 使用 SID 格式
+                return f"jdbc:oracle:thin:@{host}:{port}:{sid}"
+            else:
+                # 默认使用 database 作为 service_name
+                if database:
+                    return f"jdbc:oracle:thin:@//{host}:{port}/{database}"
+                else:
+                    return f"jdbc:oracle:thin:@{host}:{port}"
+        
+        elif db_type == 'sqlserver':
+            port = port or 1433
+            return f"jdbc:sqlserver://{host}:{port};databaseName={database}"
+        
+        else:
             raise ValueError(f"不支持的数据库类型: {db_type}")
-        
-        return jdbc_urls[db_type]
     
     def _get_jdbc_properties(self, db_config: Dict[str, Any]) -> Dict[str, str]:
         """生成 JDBC 连接属性"""

@@ -10,8 +10,8 @@ mysql-connector-python>=8.0.0
 # PostgreSQL 支持
 psycopg2-binary>=2.9.0
 
-# Oracle 支持 (可选，需要 Oracle Instant Client)
-# cx_Oracle>=8.0.0
+# Oracle 支持 (推荐使用 python-oracledb，无需 Oracle Client)
+oracledb>=1.4.0
 
 # SQL Server 支持 (可选)
 # pyodbc>=4.0.0

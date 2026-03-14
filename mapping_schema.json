@@ -13,7 +13,7 @@
     "source_db": {
       "type": "object",
       "description": "源数据库连接配置",
-      "required": ["type", "host", "port", "database"],
+      "required": ["type", "host"],
       "properties": {
         "type": {
           "type": "string",
@@ -22,10 +22,14 @@
         },
         "host": { "type": "string", "description": "数据库主机" },
         "port": { "type": "integer", "description": "数据库端口" },
-        "database": { "type": "string", "description": "数据库名称" },
+        "database": { "type": "string", "description": "数据库名称 / Oracle service_name" },
         "user": { "type": "string", "description": "用户名" },
         "password": { "type": "string", "description": "密码（建议使用环境变量）" },
-        "password_env": { "type": "string", "description": "密码环境变量名" }
+        "password_env": { "type": "string", "description": "密码环境变量名" },
+        "service_name": { "type": "string", "description": "Oracle service_name（优先于 database）" },
+        "sid": { "type": "string", "description": "Oracle SID（与 service_name 二选一）" },
+        "thick_mode": { "type": "boolean", "default": false, "description": "Oracle 是否使用 Thick 模式（需要 Oracle Client）" },
+        "oracle_client": { "type": "string", "description": "Oracle Client 库路径（thick_mode=true 时使用）" }
       }
     },
     "target_db": {

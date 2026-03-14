@@ -32,7 +32,7 @@ except ImportError:
     POSTGRES_AVAILABLE = False
 
 try:
-    import cx_Oracle
+    import oracledb
     ORACLE_AVAILABLE = True
 except ImportError:
     ORACLE_AVAILABLE = False
@@ -274,6 +274,105 @@ class SQLiteConnection(DatabaseConnection):
         return [r['name'] for r in results if r.get('pk')]
 
 
+class OracleConnection(DatabaseConnection):
+    """Oracle 连接 (使用 python-oracledb)"""
+    
+    def connect(self):
+        if not ORACLE_AVAILABLE:
+            raise ImportError("oracledb (python-oracledb) 未安装，请执行: pip install oracledb")
+        
+        password = self.config.get('password')
+        if not password and self.config.get('password_env'):
+            password = os.environ.get(self.config['password_env'])
+        
+        # 构建 DSN
+        host = self.config['host']
+        port = self.config.get('port', 1521)
+        service_name = self.config.get('service_name')
+        sid = self.config.get('sid')
+        
+        if service_name:
+            dsn = f"{host}:{port}/{service_name}"
+        elif sid:
+            dsn = oracledb.makedsn(host, port, sid=sid)
+        else:
+            # 默认使用 service_name，database 字段作为 service_name
+            database = self.config.get('database', '')
+            if database:
+                dsn = f"{host}:{port}/{database}"
+            else:
+                dsn = f"{host}:{port}"
+        
+        # 检查是否使用 Thick 模式
+        thick_mode = self.config.get('thick_mode', False)
+        oracle_client = self.config.get('oracle_client')
+        
+        if thick_mode:
+            if oracle_client:
+                oracledb.init_oracle_client(lib_dir=oracle_client)
+            else:
+                oracledb.init_oracle_client()
+            self.connection = oracledb.connect(
+                user=self.config.get('user'),
+                password=password,
+                dsn=dsn
+            )
+        else:
+            # Thin 模式 (默认，无需 Oracle Client)
+            self.connection = oracledb.connect(
+                user=self.config.get('user'),
+                password=password,
+                dsn=dsn
+            )
+    
+    def close(self):
+        if self.connection:
+            self.connection.close()
+    
+    def execute_query(self, query: str, params: tuple = None) -> List[Dict[str, Any]]:
+        cursor = self.connection.cursor()
+        try:
+            # Oracle 使用命名参数或字典
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+            
+            # 获取列名 (Oracle 列名默认为大写)
+            if cursor.description:
+                columns = [desc[0].lower() for desc in cursor.description]
+            else:
+                columns = []
+            
+            rows = cursor.fetchall()
+            return [dict(zip(columns, row)) for row in rows]
+        finally:
+            cursor.close()
+    
+    def get_table_count(self, table: str, schema: str = None, filter_clause: str = None) -> int:
+        full_table = f"{schema}.{table}" if schema else table
+        query = f'SELECT COUNT(*) as cnt FROM {full_table}'
+        if filter_clause:
+            query += f" WHERE {filter_clause}"
+        result = self.execute_query(query)
+        return result[0]['cnt'] if result else 0
+    
+    def get_primary_keys(self, table: str, schema: str = None) -> List[str]:
+        owner = schema or self.config.get('user', '').upper()
+        query = """
+            SELECT cols.column_name
+            FROM all_constraints cons
+            JOIN all_cons_columns cols ON cons.constraint_name = cols.constraint_name
+                AND cons.owner = cols.owner
+            WHERE cons.constraint_type = 'P'
+                AND cons.table_name = UPPER(:table_name)
+                AND cons.owner = UPPER(:owner)
+            ORDER BY cols.position
+        """
+        results = self.execute_query(query, {'table_name': table, 'owner': owner})
+        return [r['column_name'].lower() for r in results]
+
+
 class DatabaseConnectionFactory:
     """数据库连接工厂"""
     
@@ -285,6 +384,7 @@ class DatabaseConnectionFactory:
             'mysql': MySQLConnection,
             'postgresql': PostgreSQLConnection,
             'sqlite': SQLiteConnection,
+            'oracle': OracleConnection,
         }
         
         if db_type not in factories:
