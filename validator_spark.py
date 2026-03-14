@@ -218,11 +218,16 @@ class SparkDataValidator:
             self.config['source_db'].get('type', 'mysql')
         )
         
+        db_type = self.config['source_db'].get('type', 'mysql').lower()
+        
+        # Oracle 不支持 AS 别名语法，需要直接使用别名
+        alias_prefix = "" if db_type == 'oracle' else "AS "
+        
         # 构建带过滤条件的子查询 (谓词下推到数据库)
         if mapping.source_filter:
-            query = f"(SELECT {', '.join(source_fields)} FROM {table} WHERE {mapping.source_filter}) AS subq"
+            query = f"(SELECT {', '.join(source_fields)} FROM {table} WHERE {mapping.source_filter}) {alias_prefix}subq"
         else:
-            query = f"(SELECT {', '.join(source_fields)} FROM {table}) AS subq"
+            query = f"(SELECT {', '.join(source_fields)} FROM {table}) {alias_prefix}subq"
         
         # JDBC 并行读取配置
         options = {
@@ -236,7 +241,8 @@ class SparkDataValidator:
         if pk_fields and mapping.batch_size > 0:
             # 获取主键范围用于分区
             try:
-                bounds_query = f"(SELECT MIN({pk_fields[0]}) as min_val, MAX({pk_fields[0]}) as max_val FROM {table}) AS bounds"
+                # Oracle 不支持 AS 别名
+                bounds_query = f"(SELECT MIN({pk_fields[0]}) as min_val, MAX({pk_fields[0]}) as max_val FROM {table}) {alias_prefix}bounds"
                 bounds_df = self.spark.read.jdbc(url=jdbc_url, table=bounds_query, properties=props)
                 bounds = bounds_df.first()
                 if bounds and bounds['min_val'] is not None:
@@ -270,11 +276,16 @@ class SparkDataValidator:
             self.config['target_db'].get('type', 'mysql')
         )
         
+        db_type = self.config['target_db'].get('type', 'mysql').lower()
+        
+        # Oracle 不支持 AS 别名语法，需要直接使用别名
+        alias_prefix = "" if db_type == 'oracle' else "AS "
+        
         # 构建带过滤条件的子查询 (谓词下推)
         if mapping.target_filter:
-            query = f"(SELECT {', '.join(target_fields)} FROM {table} WHERE {mapping.target_filter}) AS subq"
+            query = f"(SELECT {', '.join(target_fields)} FROM {table} WHERE {mapping.target_filter}) {alias_prefix}subq"
         else:
-            query = f"(SELECT {', '.join(target_fields)} FROM {table}) AS subq"
+            query = f"(SELECT {', '.join(target_fields)} FROM {table}) {alias_prefix}subq"
         
         # JDBC 并行读取配置
         options = {
@@ -287,7 +298,7 @@ class SparkDataValidator:
         pk_fields = [fm.target_field for fm in mapping.field_mappings if fm.is_primary_key]
         if pk_fields and mapping.batch_size > 0:
             try:
-                bounds_query = f"(SELECT MIN({pk_fields[0]}) as min_val, MAX({pk_fields[0]}) as max_val FROM {table}) AS bounds"
+                bounds_query = f"(SELECT MIN({pk_fields[0]}) as min_val, MAX({pk_fields[0]}) as max_val FROM {table}) {alias_prefix}bounds"
                 bounds_df = self.spark.read.jdbc(url=jdbc_url, table=bounds_query, properties=props)
                 bounds = bounds_df.first()
                 if bounds and bounds['min_val'] is not None:
