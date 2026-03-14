@@ -176,7 +176,7 @@ class SparkDataValidator:
         )
     
     def read_source_table(self, mapping: TableMapping) -> DataFrame:
-        """读取源表数据"""
+        """读取源表数据 (优化: 谓词下推 + 并行读取)"""
         jdbc_url = self._get_jdbc_url(self.config['source_db'])
         props = self._get_jdbc_properties(self.config['source_db'])
         
@@ -190,22 +190,43 @@ class SparkDataValidator:
         
         source_fields = list(source_fields)
         
-        # 构建查询
+        # 构建查询 - 使用子查询实现谓词下推
         table = self._get_full_table_name(
             mapping.source_table, 
             mapping.source_schema,
             self.config['source_db'].get('type', 'mysql')
         )
         
-        df = self.spark.read.jdbc(
-            url=jdbc_url,
-            table=table,
-            properties=props
-        ).select(*source_fields)
-        
-        # 应用过滤条件
+        # 构建带过滤条件的子查询 (谓词下推到数据库)
         if mapping.source_filter:
-            df = df.where(mapping.source_filter)
+            query = f"(SELECT {', '.join(source_fields)} FROM {table} WHERE {mapping.source_filter}) AS subq"
+        else:
+            query = f"(SELECT {', '.join(source_fields)} FROM {table}) AS subq"
+        
+        # JDBC 并行读取配置
+        options = {
+            'url': jdbc_url,
+            'dbtable': query,
+            **props
+        }
+        
+        # 如果配置了分区列，启用并行读取
+        pk_fields = [fm.source_field for fm in mapping.field_mappings if fm.is_primary_key]
+        if pk_fields and mapping.batch_size > 0:
+            # 获取主键范围用于分区
+            try:
+                bounds_query = f"(SELECT MIN({pk_fields[0]}) as min_val, MAX({pk_fields[0]}) as max_val FROM {table}) AS bounds"
+                bounds_df = self.spark.read.jdbc(url=jdbc_url, table=bounds_query, properties=props)
+                bounds = bounds_df.first()
+                if bounds and bounds['min_val'] is not None:
+                    options['partitionColumn'] = pk_fields[0]
+                    options['lowerBound'] = bounds['min_val']
+                    options['upperBound'] = bounds['max_val']
+                    options['numPartitions'] = max(4, mapping.batch_size // 10000)
+            except Exception as e:
+                logger.warning(f"无法获取分区边界，使用默认读取: {e}")
+        
+        df = self.spark.read.format("jdbc").options(**options).load()
         
         # 抽样
         if mapping.sample_size > 0:
@@ -214,7 +235,7 @@ class SparkDataValidator:
         return df
     
     def read_target_table(self, mapping: TableMapping) -> DataFrame:
-        """读取目标表数据"""
+        """读取目标表数据 (优化: 谓词下推 + 并行读取)"""
         jdbc_url = self._get_jdbc_url(self.config['target_db'])
         props = self._get_jdbc_properties(self.config['target_db'])
         
@@ -228,16 +249,35 @@ class SparkDataValidator:
             self.config['target_db'].get('type', 'mysql')
         )
         
-        df = self.spark.read.jdbc(
-            url=jdbc_url,
-            table=table,
-            properties=props
-        ).select(*target_fields)
-        
-        # 应用过滤条件
+        # 构建带过滤条件的子查询 (谓词下推)
         if mapping.target_filter:
-            df = df.where(mapping.target_filter)
+            query = f"(SELECT {', '.join(target_fields)} FROM {table} WHERE {mapping.target_filter}) AS subq"
+        else:
+            query = f"(SELECT {', '.join(target_fields)} FROM {table}) AS subq"
         
+        # JDBC 并行读取配置
+        options = {
+            'url': jdbc_url,
+            'dbtable': query,
+            **props
+        }
+        
+        # 如果配置了分区列，启用并行读取
+        pk_fields = [fm.target_field for fm in mapping.field_mappings if fm.is_primary_key]
+        if pk_fields and mapping.batch_size > 0:
+            try:
+                bounds_query = f"(SELECT MIN({pk_fields[0]}) as min_val, MAX({pk_fields[0]}) as max_val FROM {table}) AS bounds"
+                bounds_df = self.spark.read.jdbc(url=jdbc_url, table=bounds_query, properties=props)
+                bounds = bounds_df.first()
+                if bounds and bounds['min_val'] is not None:
+                    options['partitionColumn'] = pk_fields[0]
+                    options['lowerBound'] = bounds['min_val']
+                    options['upperBound'] = bounds['max_val']
+                    options['numPartitions'] = max(4, mapping.batch_size // 10000)
+            except Exception as e:
+                logger.warning(f"无法获取分区边界，使用默认读取: {e}")
+        
+        df = self.spark.read.format("jdbc").options(**options).load()
         return df
     
     def apply_transform(self, df: DataFrame, transform: Dict[str, Any], 
@@ -364,29 +404,8 @@ class SparkDataValidator:
         
         return df
     
-    def compare_field(self, expected_col: str, actual_col: str, 
-                      compare_rule: str, tolerance: float = None) -> str:
-        """生成比较表达式"""
-        if compare_rule == 'skip':
-            return "true"
-        
-        if compare_rule == 'exact':
-            return f"`{expected_col}` = `{actual_col}` OR (`{expected_col}` IS NULL AND `{actual_col}` IS NULL)"
-        
-        if compare_rule == 'ignore_case':
-            return f"lower(`{expected_col}`) = lower(`{actual_col}`) OR (`{expected_col}` IS NULL AND `{actual_col}` IS NULL)"
-        
-        if compare_rule == 'ignore_whitespace':
-            return f"regexp_replace(`{expected_col}`, '\\\\s+', '') = regexp_replace(`{actual_col}`, '\\\\s+', '') OR (`{expected_col}` IS NULL AND `{actual_col}` IS NULL)"
-        
-        if compare_rule == 'numeric_tolerance':
-            tol = tolerance or 0.0
-            return f"abs(`{expected_col}` - `{actual_col}`) <= {tol} OR (`{expected_col}` IS NULL AND `{actual_col}` IS NULL)"
-        
-        return f"`{expected_col}` = `{actual_col}`"
-    
     def validate_table(self, mapping: TableMapping) -> ValidationResult:
-        """校验单表数据"""
+        """校验单表数据 (优化: 单次 FULL JOIN + 聚合统计)"""
         result = ValidationResult(
             table_name=f"{mapping.source_table} -> {mapping.target_table}"
         )
@@ -408,111 +427,133 @@ class SparkDataValidator:
                 logger.warning(f"表 {mapping.source_table} 没有配置主键，使用全部字段")
                 pk_fields = [fm.target_field for fm in mapping.field_mappings]
             
-            # 构建主键列（源端）
-            source_pk_expr = concat_ws("|", *[col(f"_expected_{f}") for f in pk_fields])
-            source_with_expected = source_with_expected.withColumn("_source_pk", source_pk_expr)
+            # 构建主键列 - 使用 struct 更安全 (避免分隔符冲突)
+            source_pk_cols = [col(f"_expected_{f}") for f in pk_fields]
+            target_pk_cols = [col(f) for f in pk_fields]
             
-            # 构建主键列（目标端）
-            target_pk_expr = concat_ws("|", *[col(f) for f in pk_fields])
-            target_df = target_df.withColumn("_target_pk", target_pk_expr)
+            source_with_expected = source_with_expected.withColumn("_source_pk", F.struct(*source_pk_cols))
+            target_df = target_df.withColumn("_target_pk", F.struct(*target_pk_cols))
             
             # 缓存数据
-            source_with_expected.cache()
-            target_df.cache()
+            source_with_expected.persist()
+            target_df.persist()
             
-            # 统计记录数
+            # 统计记录数 (触发缓存)
             source_count = source_with_expected.count()
-            target_count = target_df.count()
             result.total_rows = source_count
+            logger.info(f"源表记录数: {source_count}")
             
-            logger.info(f"源表记录数: {source_count}, 目标表记录数: {target_count}")
+            # ========== 优化: 单次 FULL OUTER JOIN 完成所有比较 ==========
+            joined_df = source_with_expected.alias("s").join(
+                target_df.alias("t"),
+                col("s._source_pk") == col("t._target_pk"),
+                "full_outer"
+            )
             
-            # 创建临时视图用于 SQL 比较
-            source_with_expected.createOrReplaceTempView("source_data")
-            target_df.createOrReplaceTempView("target_data")
+            # 添加分类标记
+            classified_df = joined_df.withColumn(
+                "_match_type",
+                when(col("s._source_pk").isNull(), "missing_in_source")
+                .when(col("t._target_pk").isNull(), "missing_in_target")
+                .otherwise("matched")
+            )
             
-            # 找出缺失记录
-            source_only = self.spark.sql("""
-                SELECT s.* FROM source_data s
-                LEFT JOIN target_data t ON s._source_pk = t._target_pk
-                WHERE t._target_pk IS NULL
-            """)
-            missing_in_target = source_only.count()
-            result.missing_in_target = missing_in_target
-            
-            target_only = self.spark.sql("""
-                SELECT t.* FROM target_data t
-                LEFT JOIN source_data s ON t._target_pk = s._source_pk
-                WHERE s._source_pk IS NULL
-            """)
-            missing_in_source = target_only.count()
-            result.missing_in_source = missing_in_source
-            
-            # 比较匹配的记录
-            matched_df = self.spark.sql("""
-                SELECT s.*, t.* FROM source_data s
-                INNER JOIN target_data t ON s._source_pk = t._target_pk
-            """)
-            
-            # 为每个字段添加比较结果
-            compare_conditions = []
+            # 对匹配记录添加字段比较结果
             for fm in mapping.field_mappings:
-                expected_col = f"_expected_{fm.target_field}"
-                actual_col = fm.target_field
-                compare_cond = self.compare_field(expected_col, actual_col, fm.compare_rule, fm.tolerance)
-                compare_conditions.append(compare_cond)
+                expected_col = f"s._expected_{fm.target_field}"
+                actual_col = f"t.{fm.target_field}"
+                result_col = f"_cmp_{fm.target_field}"
+                
+                if fm.compare_rule == 'skip':
+                    classified_df = classified_df.withColumn(result_col, lit(True))
+                elif fm.compare_rule == 'exact':
+                    classified_df = classified_df.withColumn(
+                        result_col,
+                        col(expected_col).eqNullSafe(col(actual_col))
+                    )
+                elif fm.compare_rule == 'ignore_case':
+                    classified_df = classified_df.withColumn(
+                        result_col,
+                        lower(col(expected_col)).eqNullSafe(lower(col(actual_col)))
+                    )
+                elif fm.compare_rule == 'ignore_whitespace':
+                    classified_df = classified_df.withColumn(
+                        result_col,
+                        F.regexp_replace(col(expected_col), r'\s+', '').eqNullSafe(
+                            F.regexp_replace(col(actual_col), r'\s+', '')
+                        )
+                    )
+                elif fm.compare_rule == 'numeric_tolerance':
+                    tol = fm.tolerance or 0.0
+                    classified_df = classified_df.withColumn(
+                        result_col,
+                        F.abs(col(expected_col) - col(actual_col)) <= tol
+                    )
+                else:
+                    classified_df = classified_df.withColumn(
+                        result_col,
+                        col(expected_col).eqNullSafe(col(actual_col))
+                    )
             
-            # 综合比较结果
-            all_match_expr = " AND ".join(compare_conditions)
+            # 计算所有字段是否匹配
+            cmp_cols = [col(f"_cmp_{fm.target_field}") for fm in mapping.field_mappings]
+            all_match_expr = cmp_cols[0]
+            for c in cmp_cols[1:]:
+                all_match_expr = all_match_expr & c
             
-            matched_df.createOrReplaceTempView("matched_data")
+            classified_df = classified_df.withColumn("_all_fields_match", all_match_expr)
             
-            mismatched_df = self.spark.sql(f"""
-                SELECT * FROM matched_data
-                WHERE NOT ({all_match_expr})
-            """)
+            # ========== 优化: 单次聚合计算所有统计值 ==========
+            stats = classified_df.agg(
+                F.sum(when(col("_match_type") == "missing_in_source", 1).otherwise(0)).alias("missing_in_source"),
+                F.sum(when(col("_match_type") == "missing_in_target", 1).otherwise(0)).alias("missing_in_target"),
+                F.sum(when((col("_match_type") == "matched") & col("_all_fields_match"), 1).otherwise(0)).alias("fully_matched"),
+                F.sum(when((col("_match_type") == "matched") & ~col("_all_fields_match"), 1).otherwise(0)).alias("mismatched")
+            ).first()
             
-            mismatched_count = mismatched_df.count()
-            result.mismatched_rows = mismatched_count
-            result.matched_rows = source_count - missing_in_target - mismatched_count
+            result.missing_in_source = stats["missing_in_source"] or 0
+            result.missing_in_target = stats["missing_in_target"] or 0
+            result.matched_rows = stats["fully_matched"] or 0
+            result.mismatched_rows = stats["mismatched"] or 0
             
-            # 收集错误详情（限制数量）
-            if missing_in_target > 0:
-                sample_errors = source_only.limit(10).collect()
+            logger.info(f"匹配: {result.matched_rows}, 不匹配: {result.mismatched_rows}, "
+                       f"源缺失: {result.missing_in_source}, 目标缺失: {result.missing_in_target}")
+            
+            # 收集错误样本 (限制数量)
+            if result.missing_in_target > 0:
+                sample_errors = classified_df.filter(col("_match_type") == "missing_in_target").limit(10).collect()
                 for row in sample_errors:
                     result.errors.append({
                         'type': 'missing_in_target',
-                        'key': row['_source_pk']
+                        'key': row['s._source_pk']
                     })
             
-            if missing_in_source > 0:
-                sample_errors = target_only.limit(10).collect()
+            if result.missing_in_source > 0:
+                sample_errors = classified_df.filter(col("_match_type") == "missing_in_source").limit(10).collect()
                 for row in sample_errors:
                     result.errors.append({
                         'type': 'missing_in_source',
-                        'key': row['_target_pk']
+                        'key': row['t._target_pk']
                     })
             
-            if mismatched_count > 0:
-                sample_errors = mismatched_df.limit(10).collect()
+            if result.mismatched_rows > 0:
+                sample_errors = classified_df.filter(
+                    (col("_match_type") == "matched") & ~col("_all_fields_match")
+                ).limit(10).collect()
+                
                 for row in sample_errors:
-                    # 找出不匹配的字段
                     mismatched_fields = []
                     for fm in mapping.field_mappings:
-                        expected_col = f"_expected_{fm.target_field}"
-                        actual_col = fm.target_field
-                        expected_val = row[expected_col]
-                        actual_val = row[actual_col]
-                        if expected_val != actual_val:
+                        if not row[f"_cmp_{fm.target_field}"]:
                             mismatched_fields.append({
                                 'field': fm.target_field,
-                                'expected': str(expected_val),
-                                'actual': str(actual_val)
+                                'expected': str(row[f"s._expected_{fm.target_field}"]),
+                                'actual': str(row[f"t.{fm.target_field}"])
                             })
                     
                     result.errors.append({
                         'type': 'field_mismatch',
-                        'key': row['_source_pk'],
+                        'key': row['s._source_pk'],
                         'mismatched_fields': mismatched_fields
                     })
             
