@@ -38,6 +38,12 @@ class FieldMapping:
     compare_rule: str = "exact"
     tolerance: Optional[float] = None
     description: str = ""
+    # 取值范围校验配置
+    min_value: Optional[float] = None
+    max_value: Optional[float] = None
+    allowed_values: Optional[List[Any]] = None
+    pattern: Optional[str] = None  # 正则表达式
+    value_check_expr: Optional[str] = None  # 自定义 Spark SQL 表达式
 
 
 @dataclass
@@ -64,6 +70,7 @@ class ValidationResult:
     mismatched_rows: int = 0
     missing_in_source: int = 0
     missing_in_target: int = 0
+    value_check_failed: int = 0  # 取值范围校验失败数
     errors: List[Dict[str, Any]] = field(default_factory=list)
     duration_seconds: float = 0.0
     status: str = "pending"
@@ -179,7 +186,12 @@ class SparkDataValidator:
                 nullable=fm.get('nullable', True),
                 compare_rule=fm.get('compare_rule', 'exact'),
                 tolerance=fm.get('tolerance'),
-                description=fm.get('description', '')
+                description=fm.get('description', ''),
+                min_value=fm.get('min_value'),
+                max_value=fm.get('max_value'),
+                allowed_values=fm.get('allowed_values'),
+                pattern=fm.get('pattern'),
+                value_check_expr=fm.get('value_check_expr')
             ))
         
         filters = table_config.get('filters', {})
@@ -372,15 +384,15 @@ class SparkDataValidator:
             source_field = fields[0] if fields else None
             cases = transform.get('cases', [])
             default_value = transform.get('else')
-            
+
             if source_field:
                 case_expr = None
-                for c in reversed(cases):
+                for c in cases:
                     if case_expr is None:
                         case_expr = when(col(source_field) == c['when'], lit(c['then']))
                     else:
-                        case_expr = when(col(source_field) == c['when'], lit(c['then'])).otherwise(case_expr)
-                
+                        case_expr = case_expr.when(col(source_field) == c['when'], lit(c['then']))
+
                 if case_expr is not None:
                     if default_value is not None:
                         case_expr = case_expr.otherwise(lit(default_value))
@@ -532,8 +544,67 @@ class SparkDataValidator:
             all_match_expr = cmp_cols[0]
             for c in cmp_cols[1:]:
                 all_match_expr = all_match_expr & c
-            
+
             classified_df = classified_df.withColumn("_all_fields_match", all_match_expr)
+
+            # ========== 取值范围校验 ==========
+            value_check_fields = [fm for fm in mapping.field_mappings
+                                  if any([fm.min_value is not None, fm.max_value is not None,
+                                          fm.allowed_values, fm.pattern, fm.value_check_expr])]
+
+            if value_check_fields:
+                for fm in value_check_fields:
+                    check_col = f"_value_check_{fm.target_field}"
+                    actual_col = f"t.{fm.target_field}"  # 使用表别名避免歧义
+                    check_expr = lit(True)
+
+                    # 最小值校验
+                    if fm.min_value is not None:
+                        check_expr = check_expr & (col(actual_col) >= fm.min_value)
+
+                    # 最大值校验
+                    if fm.max_value is not None:
+                        check_expr = check_expr & (col(actual_col) <= fm.max_value)
+
+                    # 允许值列表校验
+                    if fm.allowed_values:
+                        check_expr = check_expr & col(actual_col).isin(fm.allowed_values)
+
+                    # 正则表达式校验
+                    if fm.pattern:
+                        check_expr = check_expr & col(actual_col).rlike(fm.pattern)
+
+                    # 自定义表达式校验
+                    if fm.value_check_expr:
+                        # 替换字段名，添加表别名
+                        custom_expr = fm.value_check_expr.replace(fm.target_field, f"`t`.`{fm.target_field}`")
+                        check_expr = check_expr & expr(custom_expr)
+
+                    # NULL 值处理：如果字段不允许为空且值为 NULL，则校验失败
+                    if not fm.nullable:
+                        check_expr = check_expr & col(actual_col).isNotNull()
+
+                    classified_df = classified_df.withColumn(check_col, check_expr)
+
+                # 计算取值范围校验结果
+                value_check_cols = [col(f"_value_check_{fm.target_field}") for fm in value_check_fields]
+                all_value_check_expr = value_check_cols[0]
+                for c in value_check_cols[1:]:
+                    all_value_check_expr = all_value_check_expr & c
+
+                classified_df = classified_df.withColumn("_value_check_passed", all_value_check_expr)
+
+                # 统计取值范围校验失败数（仅统计目标表存在的记录）
+                value_check_stats = classified_df.filter(col("_match_type") != "missing_in_target").agg(
+                    F.sum(when(~col("_value_check_passed"), 1).otherwise(0)).alias("value_check_failed")
+                ).first()
+
+                result.value_check_failed = value_check_stats["value_check_failed"] or 0
+
+                if result.value_check_failed > 0:
+                    logger.info(f"取值范围校验失败: {result.value_check_failed}")
+            else:
+                classified_df = classified_df.withColumn("_value_check_passed", lit(True))
             
             # ========== 优化: 单次聚合计算所有统计值 ==========
             stats = classified_df.agg(
@@ -557,7 +628,7 @@ class SparkDataValidator:
                 for row in sample_errors:
                     result.errors.append({
                         'type': 'missing_in_target',
-                        'key': row['s._source_pk']
+                        'key': row['_source_pk']
                     })
             
             if result.missing_in_source > 0:
@@ -565,28 +636,65 @@ class SparkDataValidator:
                 for row in sample_errors:
                     result.errors.append({
                         'type': 'missing_in_source',
-                        'key': row['t._target_pk']
+                        'key': row['_target_pk']
                     })
             
             if result.mismatched_rows > 0:
                 sample_errors = classified_df.filter(
                     (col("_match_type") == "matched") & ~col("_all_fields_match")
                 ).limit(10).collect()
-                
+
                 for row in sample_errors:
                     mismatched_fields = []
                     for fm in mapping.field_mappings:
                         if not row[f"_cmp_{fm.target_field}"]:
                             mismatched_fields.append({
                                 'field': fm.target_field,
-                                'expected': str(row[f"s._expected_{fm.target_field}"]),
-                                'actual': str(row[f"t.{fm.target_field}"])
+                                'expected': str(row[f"_expected_{fm.target_field}"]),
+                                'actual': str(row[fm.target_field])
                             })
-                    
+
                     result.errors.append({
                         'type': 'field_mismatch',
-                        'key': row['s._source_pk'],
+                        'key': row['_source_pk'],
                         'mismatched_fields': mismatched_fields
+                    })
+
+            # 收集取值范围校验失败样本
+            if result.value_check_failed > 0:
+                sample_errors = classified_df.filter(
+                    (col("_match_type") != "missing_in_target") & ~col("_value_check_passed")
+                ).limit(10).collect()
+
+                for row in sample_errors:
+                    failed_checks = []
+                    for fm in value_check_fields:
+                        if not row[f"_value_check_{fm.target_field}"]:
+                            check_reasons = []
+                            # 获取目标表字段值 (Row 中可能需要用 t. 前缀或直接字段名)
+                            field_value = row.get(f"t.{fm.target_field}") or row.get(fm.target_field)
+
+                            if fm.min_value is not None and field_value is not None and field_value < fm.min_value:
+                                check_reasons.append(f"小于最小值 {fm.min_value}")
+                            if fm.max_value is not None and field_value is not None and field_value > fm.max_value:
+                                check_reasons.append(f"大于最大值 {fm.max_value}")
+                            if fm.allowed_values and field_value not in fm.allowed_values:
+                                check_reasons.append(f"不在允许值列表中 {fm.allowed_values}")
+                            if fm.pattern and field_value and not __import__('re').match(fm.pattern, str(field_value)):
+                                check_reasons.append(f"不匹配正则 {fm.pattern}")
+                            if fm.value_check_expr:
+                                check_reasons.append(f"不满足条件 {fm.value_check_expr}")
+
+                            failed_checks.append({
+                                'field': fm.target_field,
+                                'value': str(field_value),
+                                'reasons': check_reasons
+                            })
+
+                    result.errors.append({
+                        'type': 'value_check_failed',
+                        'key': row.get('_source_pk') or row.get('_target_pk'),
+                        'failed_checks': failed_checks
                     })
             
             # 清理缓存
@@ -641,6 +749,7 @@ class SparkDataValidator:
                     'total_mismatched': sum(r.mismatched_rows for r in self.results),
                     'total_missing_source': sum(r.missing_in_source for r in self.results),
                     'total_missing_target': sum(r.missing_in_target for r in self.results),
+                    'total_value_check_failed': sum(r.value_check_failed for r in self.results),
                 },
                 'results': [
                     {
@@ -650,6 +759,7 @@ class SparkDataValidator:
                         'mismatched_rows': r.mismatched_rows,
                         'missing_in_source': r.missing_in_source,
                         'missing_in_target': r.missing_in_target,
+                        'value_check_failed': r.value_check_failed,
                         'duration_seconds': r.duration_seconds,
                         'status': r.status,
                         'errors': r.errors[:100]
@@ -668,15 +778,16 @@ class SparkDataValidator:
             with open(report_file, 'w', encoding='utf-8') as f:
                 f.write("# 数据一致性校验报告\n\n")
                 f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                
+
                 f.write("## 概要\n\n")
                 f.write(f"- 校验表数: {len(self.results)}\n")
                 f.write(f"- 成功: {sum(1 for r in self.results if r.status == 'completed')}\n")
                 f.write(f"- 失败: {sum(1 for r in self.results if r.status == 'error')}\n")
                 f.write(f"- 不匹配记录: {sum(r.mismatched_rows for r in self.results)}\n")
                 f.write(f"- 源表缺失: {sum(r.missing_in_source for r in self.results)}\n")
-                f.write(f"- 目标表缺失: {sum(r.missing_in_target for r in self.results)}\n\n")
-                
+                f.write(f"- 目标表缺失: {sum(r.missing_in_target for r in self.results)}\n")
+                f.write(f"- 取值范围校验失败: {sum(r.value_check_failed for r in self.results)}\n\n")
+
                 f.write("## 表详情\n\n")
                 for r in self.results:
                     f.write(f"### {r.table_name}\n\n")
@@ -684,8 +795,50 @@ class SparkDataValidator:
                     f.write(f"- 总行数: {r.total_rows}\n")
                     f.write(f"- 匹配: {r.matched_rows}\n")
                     f.write(f"- 不匹配: {r.mismatched_rows}\n")
+                    f.write(f"- 源表缺失: {r.missing_in_source}\n")
+                    f.write(f"- 目标表缺失: {r.missing_in_target}\n")
+                    f.write(f"- 取值范围失败: {r.value_check_failed}\n")
                     f.write(f"- 耗时: {r.duration_seconds:.2f}s\n\n")
-            
+
+                    # 输出错误样本
+                    if r.errors:
+                        f.write("#### 错误样本\n\n")
+
+                        # 字段不匹配的记录
+                        mismatches = [e for e in r.errors if e.get('type') == 'field_mismatch']
+                        if mismatches:
+                            f.write("**字段不匹配:**\n\n")
+                            for i, err in enumerate(mismatches[:5], 1):
+                                f.write(f"{i}. 主键: `{err.get('key')}`\n")
+                                for field_err in err.get('mismatched_fields', []):
+                                    f.write(f"   - `{field_err['field']}`: 期望 `{field_err['expected']}` → 实际 `{field_err['actual']}`\n")
+                                f.write("\n")
+
+                        # 取值范围校验失败的记录
+                        value_check_errors = [e for e in r.errors if e.get('type') == 'value_check_failed']
+                        if value_check_errors:
+                            f.write("**取值范围校验失败:**\n\n")
+                            for i, err in enumerate(value_check_errors[:5], 1):
+                                f.write(f"{i}. 主键: `{err.get('key')}`\n")
+                                for check_err in err.get('failed_checks', []):
+                                    reasons = ", ".join(check_err['reasons'])
+                                    f.write(f"   - `{check_err['field']}`: 值 `{check_err['value']}` - {reasons}\n")
+                                f.write("\n")
+
+                        # 目标表缺失的记录
+                        missing_target = [e for e in r.errors if e.get('type') == 'missing_in_target']
+                        if missing_target:
+                            f.write("**目标表缺失:**\n\n")
+                            keys = [str(e.get('key')) for e in missing_target[:5]]
+                            f.write(", ".join(f"`{k}`" for k in keys) + "\n\n")
+
+                        # 源表缺失的记录
+                        missing_source = [e for e in r.errors if e.get('type') == 'missing_in_source']
+                        if missing_source:
+                            f.write("**源表缺失:**\n\n")
+                            keys = [str(e.get('key')) for e in missing_source[:5]]
+                            f.write(", ".join(f"`{k}`" for k in keys) + "\n\n")
+
             logger.info(f"Markdown 报告已生成: {report_file}")
     
     def stop(self):
