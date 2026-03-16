@@ -13,10 +13,11 @@
 
 - **灵活的字段映射**: 支持直接映射、字段转换、条件映射等多种方式
 - **多种比较规则**: 精确比较、忽略大小写、忽略空白、数值容差、跳过比较
+- **取值范围校验**: 支持最小/最大值、允许值列表、正则表达式、自定义表达式校验
 - **多数据库支持**: MySQL、PostgreSQL、SQLite（可扩展 Oracle、SQL Server）
 - **丰富的转换函数**: 字符串拼接、大小写转换、日期格式化、JSON 提取等
 - **并行校验**: 单机版支持多线程，Spark版支持分布式计算
-- **详细报告**: JSON、Markdown、HTML 多种格式报告
+- **详细报告**: JSON、Markdown、HTML 多种格式报告，包含错误样本和差异详情
 
 ## 安装
 
@@ -234,10 +235,15 @@ python-oracledb 支持两种模式：
 | `target_field` | 是 | 目标字段名 |
 | `source_field` | 二选一 | 源字段名（与 transform 二选一） |
 | `is_primary_key` | 否 | 是否为主键，默认 false |
-| `nullable` | 否 | 是否允许空值，默认 true |
+| `nullable` | 否 | 是否允许空值，默认 true（Spark版取值范围校验使用） |
 | `compare_rule` | 否 | 比较规则，默认 "exact" |
 | `tolerance` | 否 | 数值容差（compare_rule=numeric_tolerance 时） |
 | `description` | 否 | 字段说明 |
+| `min_value` | 否 | 最小值（Spark版取值范围校验） |
+| `max_value` | 否 | 最大值（Spark版取值范围校验） |
+| `allowed_values` | 否 | 允许值列表（Spark版取值范围校验） |
+| `pattern` | 否 | 正则表达式（Spark版取值范围校验） |
+| `value_check_expr` | 否 | 自定义 Spark SQL 表达式（Spark版取值范围校验） |
 
 #### 3.2 转换映射
 
@@ -347,7 +353,122 @@ python-oracledb 支持两种模式：
 }
 ```
 
-### 6. 过滤条件 (filters)
+### 6. 取值范围校验 (Spark版)
+
+取值范围校验用于验证目标表字段值是否符合预期约束，可配置多个校验条件。
+
+| 配置项 | 类型 | 说明 |
+|--------|------|------|
+| `min_value` | number | 最小值（数值类型） |
+| `max_value` | number | 最大值（数值类型） |
+| `allowed_values` | array | 允许的值列表（枚举） |
+| `pattern` | string | 正则表达式（字符串类型） |
+| `value_check_expr` | string | 自定义 Spark SQL 表达式 |
+
+#### 6.1 数值范围校验
+
+```json
+{
+  "target_field": "age",
+  "source_field": "user_age",
+  "min_value": 0,
+  "max_value": 150
+}
+```
+
+#### 6.2 枚举值校验
+
+```json
+{
+  "target_field": "status",
+  "source_field": "status_code",
+  "allowed_values": ["active", "inactive", "pending"]
+}
+```
+
+#### 6.3 正则表达式校验
+
+```json
+{
+  "target_field": "email",
+  "source_field": "email_address",
+  "pattern": "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+}
+```
+
+#### 6.4 自定义表达式校验
+
+支持 Spark SQL 表达式，可用于复杂的校验逻辑：
+
+```json
+{
+  "target_field": "price",
+  "source_field": "unit_price",
+  "value_check_expr": "price > 0 AND price < 1000000"
+}
+```
+
+```json
+{
+  "target_field": "discount",
+  "source_field": "discount_rate",
+  "value_check_expr": "discount >= 0 AND discount <= price"
+}
+```
+
+#### 6.5 组合校验
+
+可以同时配置多个校验条件：
+
+```json
+{
+  "target_field": "score",
+  "source_field": "exam_score",
+  "min_value": 0,
+  "max_value": 100,
+  "value_check_expr": "score % 1 = 0"
+}
+```
+
+#### 6.6 NULL 值处理
+
+通过 `nullable` 配置项控制 NULL 值的处理方式：
+
+```json
+{
+  "target_field": "nickname",
+  "source_field": "nick_name",
+  "allowed_values": ["Alice", "Bob", "Charlie"],
+  "nullable": true
+}
+```
+
+| `nullable` 值 | NULL 值行为 |
+|---------------|-------------|
+| `true`（默认） | NULL 值通过校验，不检查其他条件 |
+| `false` | NULL 值校验失败，报告显示"字段不允许为空" |
+
+**注意事项**：
+- Spark SQL 的 `isin()`、`rlike()` 等函数对 NULL 返回 NULL（非 TRUE/FALSE）
+- 工具内部已处理此问题，`nullable: true` 时 NULL 值会跳过所有取值范围检查
+- 报告中 NULL 值显示为 `NULL` 而非 `None`
+
+#### 6.7 报告输出示例
+
+校验失败时，报告中会显示详细错误信息：
+
+```markdown
+**取值范围校验失败:**
+
+1. 主键: `{user_id: 123}`
+   - `age`: 值 `200` - 大于最大值 150
+   - `status`: 值 `unknown` - 不在允许值列表中 ['active', 'inactive', 'pending']
+
+2. 主键: `{user_id: 456}`
+   - `email`: 值 `NULL` - 字段不允许为空
+```
+
+### 7. 过滤条件 (filters)
 
 ```json
 {
@@ -358,7 +479,7 @@ python-oracledb 支持两种模式：
 }
 ```
 
-### 7. 全局设置 (global_settings)
+### 8. 全局设置 (global_settings)
 
 ```json
 {
@@ -489,7 +610,13 @@ python validator_spark.py <config.json> [--master <spark-master>]
        ├── 目标有源无 → missing_in_source
        └── 都有 → 按 compare_rule 比较字段
    ↓
-4. 生成报告（JSON/Markdown）
+4. 取值范围校验（Spark版）
+   ├── 检查 min_value / max_value
+   ├── 检查 allowed_values
+   ├── 检查 pattern 正则
+   └── 检查 value_check_expr
+   ↓
+5. 生成报告（JSON/Markdown）
 ```
 
 ---
@@ -504,6 +631,7 @@ users -> user_profile: completed
   匹配: 9850/10000
   不匹配: 120
   目标表缺失: 30
+  取值范围失败: 15
 
 校验完成！
 ```
