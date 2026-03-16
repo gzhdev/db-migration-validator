@@ -666,13 +666,21 @@ class SparkDataValidator:
                     (col("_match_type") != "missing_in_target") & ~col("_value_check_passed")
                 ).limit(10).collect()
 
+                # 获取 Row 的字段名列表
+                row_fields = sample_errors[0].__fields__ if sample_errors else []
+
                 for row in sample_errors:
                     failed_checks = []
                     for fm in value_check_fields:
                         if not row[f"_value_check_{fm.target_field}"]:
                             check_reasons = []
-                            # 获取目标表字段值 (Row 中可能需要用 t. 前缀或直接字段名)
-                            field_value = row.get(f"t.{fm.target_field}") or row.get(fm.target_field)
+                            # 获取目标表字段值 (尝试多种列名格式)
+                            field_value = None
+                            t_col_name = f"t.{fm.target_field}"
+                            if t_col_name in row_fields:
+                                field_value = row[t_col_name]
+                            elif fm.target_field in row_fields:
+                                field_value = row[fm.target_field]
 
                             if fm.min_value is not None and field_value is not None and field_value < fm.min_value:
                                 check_reasons.append(f"小于最小值 {fm.min_value}")
@@ -691,9 +699,16 @@ class SparkDataValidator:
                                 'reasons': check_reasons
                             })
 
+                    # 获取主键值
+                    key_value = None
+                    if '_source_pk' in row_fields:
+                        key_value = row['_source_pk']
+                    elif '_target_pk' in row_fields:
+                        key_value = row['_target_pk']
+
                     result.errors.append({
                         'type': 'value_check_failed',
-                        'key': row.get('_source_pk') or row.get('_target_pk'),
+                        'key': key_value,
                         'failed_checks': failed_checks
                     })
             
