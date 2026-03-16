@@ -49,10 +49,17 @@ pip install pyspark mysql-connector-python psycopg2-binary
 
 ### Core Components
 
-**Data Classes** (both versions share these):
+**Data Classes** (Spark version):
+- `SourceTable`: Defines a source table in multi-table JOIN (table_name, alias, join_type, join_condition)
 - `FieldMapping`: Defines how a target field maps from source (direct field or transform)
-- `TableMapping`: Contains source/target table info, field mappings, filters
+- `TableMapping`: Contains source/target table info, field mappings, filters; supports single-table and multi-table modes
 - `ValidationResult`: Stores validation outcomes (matched, mismatched, missing counts)
+
+**Multi-Table JOIN Support** (Spark version only):
+- `source_tables` array defines multiple source tables with aliases
+- `table_filters` defines per-table WHERE conditions
+- Field references use `alias.field` format (e.g., `o.id`, `u.name`)
+- `is_multi_source()` method on `TableMapping` determines mode
 
 **Database Connection Pattern** (validator.py):
 - Abstract `DatabaseConnection` class with concrete implementations for MySQL, PostgreSQL, SQLite, Oracle
@@ -70,7 +77,10 @@ pip install pyspark mysql-connector-python psycopg2-binary
 1. **Load config** - JSON mapping file with source_db, target_db, tables array
 2. **Connect databases** - Establish connections via JDBC (Spark) or drivers (single-machine)
 3. **For each table mapping**:
-   - Build source query (extract only needed fields)
+   - Validate configuration (alias uniqueness, JOIN conditions, field references)
+   - Build source query:
+     - Single-table: `(SELECT fields FROM table WHERE filter) AS subq`
+     - Multi-table: `(SELECT alias_fields FROM table1 alias1 JOIN_TYPE table2 alias2 ON condition WHERE filters) subq`
    - Build target query
    - Load data into DataFrame/list of dicts
    - Apply transforms to calculate "expected values" for target fields
@@ -138,9 +148,11 @@ pip install pyspark mysql-connector-python psycopg2-binary
 
 ## Configuration File Structure
 
+### Single-Table Mode (Backward Compatible)
+
 ```json
 {
-  "version": "1.0",
+  "version": "1.1",
   "source_db": { "type": "mysql|postgresql|oracle|sqlite", "host": "...", "database": "...", "user": "...", "password_env": "..." },
   "target_db": { ... },
   "tables": [
@@ -171,6 +183,29 @@ pip install pyspark mysql-connector-python psycopg2-binary
 }
 ```
 
+### Multi-Table JOIN Mode (Spark version only)
+
+```json
+{
+  "version": "1.1",
+  "tables": [
+    {
+      "source_tables": [
+        { "table_name": "orders", "alias": "o", "join_type": "primary" },
+        { "table_name": "users", "alias": "u", "join_type": "left", "join_condition": "o.user_id = u.id" }
+      ],
+      "table_filters": { "o": "o.deleted_at IS NULL" },
+      "target_table": "order_detail",
+      "field_mappings": [
+        { "target_field": "order_id", "source_field": "o.id", "is_primary_key": true },
+        { "target_field": "customer", "source_field": "u.name", "nullable": true },
+        { "target_field": "total", "transform": { "type": "math", "fields": ["o.price", "o.qty"], "expression": "o.price * o.qty" } }
+      ]
+    }
+  ]
+}
+```
+
 ## Important Implementation Notes
 
 - **Primary key handling**: If no `is_primary_key: true` fields are configured, all fields are used for joining
@@ -181,3 +216,10 @@ pip install pyspark mysql-connector-python psycopg2-binary
 - **Spark 4.x compatibility**: Row objects in Spark 4.x don't support `get()` method; use `row[field]` with `__fields__` check instead
 - **Column ambiguity**: After DataFrame join with alias, use `t.field_name` format to avoid ambiguity errors
 - **NULL display**: Reports show `NULL` (not `None`) for null field values
+- **Multi-table JOIN limitations**:
+  - Not supported in single-machine version (`validator.py`)
+  - Partition reads disabled for multi-table mode (no parallel JDBC)
+  - Column name conflicts resolved with `alias_field` format (e.g., `o_id`, `u_name`)
+- **Field alias resolution**:
+  - `alias.field` in config → `alias_field` in DataFrame column
+  - `field_alias_map` tracks this mapping for transform processing

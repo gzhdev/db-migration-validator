@@ -28,6 +28,16 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class SourceTable:
+    """多表 JOIN 中的源表配置"""
+    table_name: str
+    alias: str  # 表别名 (必需)
+    schema: Optional[str] = None
+    join_type: str = "inner"  # inner, left, right, full, cross, primary (仅第一个表使用)
+    join_condition: Optional[str] = None  # 除第一个表外必需
+
+
+@dataclass
 class FieldMapping:
     """字段映射配置"""
     target_field: str
@@ -44,21 +54,30 @@ class FieldMapping:
     allowed_values: Optional[List[Any]] = None
     pattern: Optional[str] = None  # 正则表达式
     value_check_expr: Optional[str] = None  # 自定义 Spark SQL 表达式
+    # 多表 JOIN 支持
+    source_alias: Optional[str] = None  # 源表别名，用于多表 JOIN
 
 
 @dataclass
 class TableMapping:
     """表映射配置"""
-    source_table: str
-    target_table: str
-    field_mappings: List[FieldMapping]
+    source_table: Optional[str] = None  # 单表模式 (向后兼容)
+    target_table: str = ""
+    field_mappings: List[FieldMapping] = field(default_factory=list)
     source_schema: Optional[str] = None
     target_schema: Optional[str] = None
     description: str = ""
-    source_filter: Optional[str] = None
+    source_filter: Optional[str] = None  # 单表模式过滤条件 (向后兼容)
     target_filter: Optional[str] = None
     sample_size: int = 0
     batch_size: int = 1000
+    # 多表 JOIN 支持
+    source_tables: List[SourceTable] = field(default_factory=list)
+    table_filters: Dict[str, str] = field(default_factory=dict)  # 各表过滤条件，key 为 alias
+
+    def is_multi_source(self) -> bool:
+        """判断是否为多表 JOIN 模式"""
+        return len(self.source_tables) > 0
 
 
 @dataclass
@@ -173,14 +192,228 @@ class SparkDataValidator:
         if schema:
             return f"{schema}.{table}"
         return table
+
+    def build_source_query(self, mapping: TableMapping) -> Tuple[str, Dict[str, str]]:
+        """
+        构建源表查询 SQL
+        返回: (query_sql, field_alias_map) - 查询语句和字段别名映射 (alias.field -> field)
+        """
+        if mapping.is_multi_source():
+            return self._build_multi_table_join_query(mapping)
+        else:
+            return self._build_single_table_query(mapping)
+
+    def _build_single_table_query(self, mapping: TableMapping) -> Tuple[str, Dict[str, str]]:
+        """构建单表查询 SQL"""
+        # 收集需要的源字段
+        source_fields = set()
+        for fm in mapping.field_mappings:
+            if fm.source_field:
+                # 去除别名前缀 (如果有)
+                field_name = fm.source_field.split('.')[-1] if '.' in fm.source_field else fm.source_field
+                source_fields.add(field_name)
+            elif fm.transform and fm.transform.get('fields'):
+                for f in fm.transform['fields']:
+                    field_name = f.split('.')[-1] if '.' in f else f
+                    source_fields.add(field_name)
+
+        source_fields = list(source_fields)
+
+        # 构建表名
+        table = self._get_full_table_name(
+            mapping.source_table,
+            mapping.source_schema,
+            self.config['source_db'].get('type', 'mysql')
+        )
+
+        db_type = self.config['source_db'].get('type', 'mysql').lower()
+        alias_prefix = "" if db_type == 'oracle' else "AS "
+
+        # 构建带过滤条件的子查询 (谓词下推到数据库)
+        if mapping.source_filter:
+            query = f"(SELECT {', '.join(source_fields)} FROM {table} WHERE {mapping.source_filter}) {alias_prefix}subq"
+        else:
+            query = f"(SELECT {', '.join(source_fields)} FROM {table}) {alias_prefix}subq"
+
+        # 字段映射 (单表模式下无别名前缀)
+        field_alias_map = {f: f for f in source_fields}
+
+        return query, field_alias_map
+
+    def _build_multi_table_join_query(self, mapping: TableMapping) -> Tuple[str, Dict[str, str]]:
+        """构建多表 JOIN 查询 SQL"""
+        if not mapping.source_tables:
+            raise ValueError("多表 JOIN 模式需要配置 source_tables")
+
+        db_type = self.config['source_db'].get('type', 'mysql').lower()
+        is_oracle = db_type == 'oracle'
+
+        # 收集需要的源字段 (带别名)
+        source_fields_with_alias = self._collect_source_fields_with_alias(mapping)
+
+        # 构建字段列表 (alias.field AS alias_field)
+        select_fields = []
+        field_alias_map = {}  # alias.field -> 实际列名 (alias_field)
+
+        for alias, field in source_fields_with_alias:
+            col_name = f"{alias}_{field}"  # 在 DataFrame 中的列名
+            if is_oracle:
+                # Oracle 不支持 AS 别名
+                select_fields.append(f"{alias}.{field} {col_name}")
+            else:
+                select_fields.append(f"{alias}.{field} AS {col_name}")
+            field_alias_map[f"{alias}.{field}"] = col_name
+
+        # 构建 FROM 子句 (第一个表)
+        first_table = mapping.source_tables[0]
+        first_table_name = self._get_full_table_name(
+            first_table.table_name,
+            first_table.schema or mapping.source_schema,
+            db_type
+        )
+
+        if is_oracle:
+            from_clause = f"{first_table_name} {first_table.alias}"
+        else:
+            from_clause = f"{first_table_name} AS {first_table.alias}"
+
+        # 构建 JOIN 子句
+        join_clauses = []
+        where_conditions = []
+
+        # 第一个表的过滤条件
+        if first_table.alias in mapping.table_filters:
+            where_conditions.append(mapping.table_filters[first_table.alias])
+
+        for source_table in mapping.source_tables[1:]:
+            table_name = self._get_full_table_name(
+                source_table.table_name,
+                source_table.schema or mapping.source_schema,
+                db_type
+            )
+
+            join_type = source_table.join_type.upper()
+            if join_type == 'PRIMARY':
+                join_type = 'INNER'  # primary 作为 inner 处理
+
+            # Oracle 不支持 AS 别名
+            if is_oracle:
+                table_ref = f"{table_name} {source_table.alias}"
+            else:
+                table_ref = f"{table_name} AS {source_table.alias}"
+
+            join_condition = source_table.join_condition
+            if not join_condition:
+                raise ValueError(f"表 {source_table.table_name} (alias: {source_table.alias}) 缺少 join_condition")
+
+            join_clauses.append(f"{join_type} JOIN {table_ref} ON {join_condition}")
+
+            # 添加该表的过滤条件
+            if source_table.alias in mapping.table_filters:
+                where_conditions.append(mapping.table_filters[source_table.alias])
+
+        # 组装完整 SQL
+        sql_parts = [
+            f"SELECT {', '.join(select_fields)}",
+            f"FROM {from_clause}"
+        ]
+        sql_parts.extend(join_clauses)
+
+        if where_conditions:
+            sql_parts.append(f"WHERE {' AND '.join(where_conditions)}")
+
+        query = "(" + " ".join(sql_parts) + ") subq"
+
+        return query, field_alias_map
+
+    def _collect_source_fields_with_alias(self, mapping: TableMapping) -> List[Tuple[str, str]]:
+        """
+        收集所有需要的源字段 (带别名)
+        返回: [(alias, field_name), ...]
+        """
+        fields_with_alias = set()
+
+        for fm in mapping.field_mappings:
+            if fm.source_field:
+                # 解析 alias.field 格式
+                if '.' in fm.source_field:
+                    alias, field = fm.source_field.split('.', 1)
+                    fields_with_alias.add((alias, field))
+                elif fm.source_alias:
+                    fields_with_alias.add((fm.source_alias, fm.source_field))
+                else:
+                    # 无别名，使用第一个表的别名
+                    if mapping.source_tables:
+                        first_alias = mapping.source_tables[0].alias
+                        fields_with_alias.add((first_alias, fm.source_field))
+                    else:
+                        # 单表模式，无别名
+                        fields_with_alias.add(('', fm.source_field))
+
+            elif fm.transform and fm.transform.get('fields'):
+                for f in fm.transform['fields']:
+                    if '.' in f:
+                        alias, field = f.split('.', 1)
+                        fields_with_alias.add((alias, field))
+                    elif mapping.source_tables:
+                        first_alias = mapping.source_tables[0].alias
+                        fields_with_alias.add((first_alias, f))
+                    else:
+                        fields_with_alias.add(('', f))
+
+        # 过滤掉空别名的情况 (单表模式)
+        return [(a, f) for a, f in fields_with_alias if a]
     
     def load_table_mapping(self, table_config: Dict[str, Any]) -> TableMapping:
-        """加载表映射配置"""
+        """加载表映射配置 (支持单表和多表 JOIN 模式)"""
+        field_mappings = self._parse_field_mappings(table_config.get('field_mappings', []))
+
+        # 解析多表 JOIN 配置
+        source_tables = []
+        if 'source_tables' in table_config:
+            for st in table_config['source_tables']:
+                source_tables.append(SourceTable(
+                    table_name=st['table_name'],
+                    alias=st['alias'],
+                    schema=st.get('schema'),
+                    join_type=st.get('join_type', 'inner'),
+                    join_condition=st.get('join_condition')
+                ))
+
+        filters = table_config.get('filters', {})
+        table_filters = table_config.get('table_filters', {})
+
+        return TableMapping(
+            source_table=table_config.get('source_table'),  # 单表模式
+            target_table=table_config['target_table'],
+            field_mappings=field_mappings,
+            source_schema=table_config.get('source_schema'),
+            target_schema=table_config.get('target_schema'),
+            description=table_config.get('description', ''),
+            source_filter=filters.get('source_filter'),  # 单表模式过滤条件
+            target_filter=filters.get('target_filter'),
+            sample_size=table_config.get('sample_size', 0),
+            batch_size=table_config.get('batch_size', 1000),
+            source_tables=source_tables,
+            table_filters=table_filters
+        )
+
+    def _parse_field_mappings(self, field_configs: List[Dict[str, Any]]) -> List[FieldMapping]:
+        """解析字段映射配置"""
         field_mappings = []
-        for fm in table_config['field_mappings']:
+        for fm in field_configs:
+            source_field = fm.get('source_field')
+            source_alias = None
+
+            # 解析带别名的字段引用 (e.g., "o.id" -> alias="o", field="id")
+            if source_field and '.' in source_field:
+                parts = source_field.split('.', 1)
+                source_alias = parts[0]
+                # source_field 保持原样，在后续处理中会解析
+
             field_mappings.append(FieldMapping(
                 target_field=fm['target_field'],
-                source_field=fm.get('source_field'),
+                source_field=source_field,
                 transform=fm.get('transform'),
                 is_primary_key=fm.get('is_primary_key', False),
                 nullable=fm.get('nullable', True),
@@ -191,87 +424,117 @@ class SparkDataValidator:
                 max_value=fm.get('max_value'),
                 allowed_values=fm.get('allowed_values'),
                 pattern=fm.get('pattern'),
-                value_check_expr=fm.get('value_check_expr')
+                value_check_expr=fm.get('value_check_expr'),
+                source_alias=source_alias
             ))
-        
-        filters = table_config.get('filters', {})
-        return TableMapping(
-            source_table=table_config['source_table'],
-            target_table=table_config['target_table'],
-            field_mappings=field_mappings,
-            source_schema=table_config.get('source_schema'),
-            target_schema=table_config.get('target_schema'),
-            description=table_config.get('description', ''),
-            source_filter=filters.get('source_filter'),
-            target_filter=filters.get('target_filter'),
-            sample_size=table_config.get('sample_size', 0),
-            batch_size=table_config.get('batch_size', 1000)
-        )
+        return field_mappings
+
+    def validate_table_mapping(self, mapping: TableMapping) -> List[str]:
+        """
+        验证表映射配置的有效性
+
+        Returns:
+            错误消息列表，空列表表示验证通过
+        """
+        errors = []
+
+        if mapping.is_multi_source():
+            # 验证别名唯一性
+            aliases = [st.alias for st in mapping.source_tables]
+            if len(aliases) != len(set(aliases)):
+                duplicate_aliases = [a for a in aliases if aliases.count(a) > 1]
+                errors.append(f"源表别名重复: {set(duplicate_aliases)}")
+
+            # 验证 JOIN 条件完整性 (第一个表除外)
+            for i, st in enumerate(mapping.source_tables):
+                if i == 0:
+                    # 第一个表应该使用 'primary' 或无 join_type
+                    if st.join_type.lower() not in ('primary', 'inner'):
+                        errors.append(f"第一个源表 {st.table_name} (alias: {st.alias}) 的 join_type 应为 'primary'")
+                else:
+                    # 其他表必须有 join_condition
+                    if not st.join_condition:
+                        errors.append(f"源表 {st.table_name} (alias: {st.alias}) 缺少 join_condition")
+
+            # 验证字段引用的别名有效性
+            valid_aliases = set(aliases)
+            for fm in mapping.field_mappings:
+                if fm.source_field and '.' in fm.source_field:
+                    alias = fm.source_field.split('.')[0]
+                    if alias not in valid_aliases:
+                        errors.append(f"字段 {fm.source_field} 引用了无效的表别名 '{alias}'")
+
+                if fm.transform and fm.transform.get('fields'):
+                    for f in fm.transform['fields']:
+                        if '.' in f:
+                            alias = f.split('.')[0]
+                            if alias not in valid_aliases:
+                                errors.append(f"Transform 字段 {f} 引用了无效的表别名 '{alias}'")
+
+        else:
+            # 单表模式验证
+            if not mapping.source_table:
+                errors.append("单表模式需要配置 source_table")
+
+        return errors
     
-    def read_source_table(self, mapping: TableMapping) -> DataFrame:
-        """读取源表数据 (优化: 谓词下推 + 并行读取)"""
+    def read_source_table(self, mapping: TableMapping) -> Tuple[DataFrame, Dict[str, str]]:
+        """
+        读取源表数据 (优化: 谓词下推 + 并行读取)
+        返回: (DataFrame, field_alias_map) - 数据帧和字段别名映射
+        """
         jdbc_url = self._get_jdbc_url(self.config['source_db'])
         props = self._get_jdbc_properties(self.config['source_db'])
-        
-        # 收集需要的源字段
-        source_fields = set()
-        for fm in mapping.field_mappings:
-            if fm.source_field:
-                source_fields.add(fm.source_field)
-            elif fm.transform and fm.transform.get('fields'):
-                source_fields.update(fm.transform['fields'])
-        
-        source_fields = list(source_fields)
-        
-        # 构建查询 - 使用子查询实现谓词下推
-        table = self._get_full_table_name(
-            mapping.source_table, 
-            mapping.source_schema,
-            self.config['source_db'].get('type', 'mysql')
-        )
-        
-        db_type = self.config['source_db'].get('type', 'mysql').lower()
-        
-        # Oracle 不支持 AS 别名语法，需要直接使用别名
-        alias_prefix = "" if db_type == 'oracle' else "AS "
-        
-        # 构建带过滤条件的子查询 (谓词下推到数据库)
-        if mapping.source_filter:
-            query = f"(SELECT {', '.join(source_fields)} FROM {table} WHERE {mapping.source_filter}) {alias_prefix}subq"
-        else:
-            query = f"(SELECT {', '.join(source_fields)} FROM {table}) {alias_prefix}subq"
-        
-        # JDBC 并行读取配置
+
+        # 使用新的查询构建器
+        query, field_alias_map = self.build_source_query(mapping)
+
+        # JDBC 读取配置
         options = {
             'url': jdbc_url,
             'dbtable': query,
             **props
         }
-        
-        # 如果配置了分区列，启用并行读取
-        pk_fields = [fm.source_field for fm in mapping.field_mappings if fm.is_primary_key]
-        if pk_fields and mapping.batch_size > 0:
-            # 获取主键范围用于分区
-            try:
-                # Oracle 不支持 AS 别名
-                bounds_query = f"(SELECT MIN({pk_fields[0]}) as min_val, MAX({pk_fields[0]}) as max_val FROM {table}) {alias_prefix}bounds"
-                bounds_df = self.spark.read.jdbc(url=jdbc_url, table=bounds_query, properties=props)
-                bounds = bounds_df.first()
-                if bounds and bounds['min_val'] is not None:
-                    options['partitionColumn'] = pk_fields[0]
-                    options['lowerBound'] = bounds['min_val']
-                    options['upperBound'] = bounds['max_val']
-                    options['numPartitions'] = max(4, mapping.batch_size // 10000)
-            except Exception as e:
-                logger.warning(f"无法获取分区边界，使用默认读取: {e}")
-        
+
+        # 多表 JOIN 模式不支持分区读取
+        if not mapping.is_multi_source():
+            # 单表模式: 如果配置了分区列，启用并行读取
+            # 注意：只使用有 source_field 的主键字段（transform 字段不能用于分区）
+            pk_fields = [fm.source_field for fm in mapping.field_mappings
+                         if fm.is_primary_key and fm.source_field]
+            if pk_fields and mapping.batch_size > 0:
+                pk_field = pk_fields[0]
+                # 去除别名前缀
+                if '.' in pk_field:
+                    pk_field = pk_field.split('.')[-1]
+
+                table = self._get_full_table_name(
+                    mapping.source_table,
+                    mapping.source_schema,
+                    self.config['source_db'].get('type', 'mysql')
+                )
+                db_type = self.config['source_db'].get('type', 'mysql').lower()
+                alias_prefix = "" if db_type == 'oracle' else "AS "
+
+                try:
+                    bounds_query = f"(SELECT MIN({pk_field}) as min_val, MAX({pk_field}) as max_val FROM {table}) {alias_prefix}bounds"
+                    bounds_df = self.spark.read.jdbc(url=jdbc_url, table=bounds_query, properties=props)
+                    bounds = bounds_df.first()
+                    if bounds and bounds['min_val'] is not None:
+                        options['partitionColumn'] = pk_field
+                        options['lowerBound'] = bounds['min_val']
+                        options['upperBound'] = bounds['max_val']
+                        options['numPartitions'] = max(4, mapping.batch_size // 10000)
+                except Exception as e:
+                    logger.warning(f"无法获取分区边界，使用默认读取: {e}")
+
         df = self.spark.read.format("jdbc").options(**options).load()
-        
+
         # 抽样
         if mapping.sample_size > 0:
             df = df.sample(withReplacement=False, fraction=1.0).limit(mapping.sample_size)
-        
-        return df
+
+        return df, field_alias_map
     
     def read_target_table(self, mapping: TableMapping) -> DataFrame:
         """读取目标表数据 (优化: 谓词下推 + 并行读取)"""
@@ -324,153 +587,183 @@ class SparkDataValidator:
         df = self.spark.read.format("jdbc").options(**options).load()
         return df
     
-    def apply_transform(self, df: DataFrame, transform: Dict[str, Any], 
-                        field_mappings: List[FieldMapping]) -> DataFrame:
-        """应用字段转换，返回包含转换后字段的 DataFrame"""
+    def apply_transform(self, df: DataFrame, transform: Dict[str, Any],
+                        field_alias_map: Dict[str, str] = None) -> DataFrame:
+        """
+        应用字段转换，返回包含转换后字段的 DataFrame
+
+        Args:
+            df: 源 DataFrame
+            transform: 转换配置
+            field_alias_map: 字段别名映射 (alias.field -> 实际列名)
+        """
         transform_type = transform.get('type')
-        
-        # 收集源字段
+        field_alias_map = field_alias_map or {}
+
+        # 收集源字段并转换为实际列名
         fields = transform.get('fields', [])
+        actual_fields = []
+        for f in fields:
+            actual_col = field_alias_map.get(f, f)
+            # 如果字段名带别名但未在映射中，尝试去除别名
+            if '.' in f and f not in field_alias_map:
+                actual_col = f.split('.')[-1]
+            actual_fields.append((f, actual_col))
+
         output_field = f"_transformed_{transform_type}"
-        
+
         if transform_type == 'concat':
             separator = transform.get('separator', '')
-            df = df.withColumn(output_field, concat_ws(separator, *[col(f) for f in fields]))
-        
+            df = df.withColumn(output_field, concat_ws(separator, *[col(actual) for _, actual in actual_fields]))
+
         elif transform_type == 'upper':
-            source_field = fields[0] if fields else None
-            if source_field:
-                df = df.withColumn(output_field, upper(col(source_field)))
-        
+            if actual_fields:
+                df = df.withColumn(output_field, upper(col(actual_fields[0][1])))
+
         elif transform_type == 'lower':
-            source_field = fields[0] if fields else None
-            if source_field:
-                df = df.withColumn(output_field, lower(col(source_field)))
-        
+            if actual_fields:
+                df = df.withColumn(output_field, lower(col(actual_fields[0][1])))
+
         elif transform_type == 'trim':
-            source_field = fields[0] if fields else None
-            if source_field:
-                df = df.withColumn(output_field, trim(col(source_field)))
-        
+            if actual_fields:
+                df = df.withColumn(output_field, trim(col(actual_fields[0][1])))
+
         elif transform_type == 'substring':
-            source_field = fields[0] if fields else None
-            start = transform.get('start', 1)
-            length = transform.get('length')
-            if source_field:
+            if actual_fields:
+                start = transform.get('start', 1)
+                length = transform.get('length')
                 if length:
-                    df = df.withColumn(output_field, substring(col(source_field), start, length))
+                    df = df.withColumn(output_field, substring(col(actual_fields[0][1]), start, length))
                 else:
-                    df = df.withColumn(output_field, substring(col(source_field), start, 1000000))
-        
+                    df = df.withColumn(output_field, substring(col(actual_fields[0][1]), start, 1000000))
+
         elif transform_type == 'replace':
-            source_field = fields[0] if fields else None
-            pattern = transform.get('pattern', '')
-            replacement = transform.get('replacement', '')
-            if source_field:
-                df = df.withColumn(output_field, regexp_replace(col(source_field), pattern, replacement))
-        
+            if actual_fields:
+                pattern = transform.get('pattern', '')
+                replacement = transform.get('replacement', '')
+                df = df.withColumn(output_field, regexp_replace(col(actual_fields[0][1]), pattern, replacement))
+
         elif transform_type == 'constant':
             value = transform.get('value')
             df = df.withColumn(output_field, lit(value))
-        
+
         elif transform_type == 'coalesce':
             default = transform.get('default')
-            cols_to_check = [col(f) for f in fields]
+            cols_to_check = [col(actual) for _, actual in actual_fields]
             if default is not None:
                 cols_to_check.append(lit(default))
             df = df.withColumn(output_field, coalesce(*cols_to_check))
-        
-        elif transform_type == 'case':
-            source_field = fields[0] if fields else None
-            cases = transform.get('cases', [])
-            default_value = transform.get('else')
 
-            if source_field:
+        elif transform_type == 'case':
+            if actual_fields:
+                actual_col = actual_fields[0][1]
+                cases = transform.get('cases', [])
+                default_value = transform.get('else')
+
                 case_expr = None
                 for c in cases:
                     if case_expr is None:
-                        case_expr = when(col(source_field) == c['when'], lit(c['then']))
+                        case_expr = when(col(actual_col) == c['when'], lit(c['then']))
                     else:
-                        case_expr = case_expr.when(col(source_field) == c['when'], lit(c['then']))
+                        case_expr = case_expr.when(col(actual_col) == c['when'], lit(c['then']))
 
                 if case_expr is not None:
                     if default_value is not None:
                         case_expr = case_expr.otherwise(lit(default_value))
                     df = df.withColumn(output_field, case_expr)
-        
+
         elif transform_type == 'cast':
-            source_field = fields[0] if fields else None
-            cast_type = transform.get('cast_type', 'string')
-            type_map = {
-                'string': StringType(),
-                'int': IntegerType(),
-                'float': DoubleType(),
-                'bool': BooleanType(),
-            }
-            if source_field and cast_type in type_map:
-                df = df.withColumn(output_field, col(source_field).cast(type_map[cast_type]))
-        
+            if actual_fields:
+                cast_type = transform.get('cast_type', 'string')
+                type_map = {
+                    'string': StringType(),
+                    'int': IntegerType(),
+                    'float': DoubleType(),
+                    'bool': BooleanType(),
+                }
+                if cast_type in type_map:
+                    df = df.withColumn(output_field, col(actual_fields[0][1]).cast(type_map[cast_type]))
+
         elif transform_type == 'math':
             expression = transform.get('expression', '')
             if expression:
-                # 替换字段名为列引用
+                # 替换字段名为实际列名
                 expr_replaced = expression
-                for f in fields:
-                    expr_replaced = expr_replaced.replace(f, f"`{f}`")
+                for orig_field, actual_col in actual_fields:
+                    # 替换带别名的字段引用 (o.price -> `o_price`)
+                    expr_replaced = expr_replaced.replace(orig_field, f"`{actual_col}`")
                 df = df.withColumn(output_field, expr(expr_replaced))
-        
+
         else:
             # 未知转换类型，直接取第一个字段
-            if fields:
-                df = df.withColumn(output_field, col(fields[0]))
-        
+            if actual_fields:
+                df = df.withColumn(output_field, col(actual_fields[0][1]))
+
         return df
-    
-    def build_source_df(self, source_df: DataFrame, mapping: TableMapping) -> DataFrame:
-        """构建源 DataFrame，包含所有需要的比较字段"""
+
+    def build_source_df(self, source_df: DataFrame, mapping: TableMapping,
+                        field_alias_map: Dict[str, str] = None) -> DataFrame:
+        """
+        构建源 DataFrame，包含所有需要的比较字段
+
+        Args:
+            source_df: 源数据 DataFrame
+            mapping: 表映射配置
+            field_alias_map: 字段别名映射 (alias.field -> 实际列名)
+        """
         df = source_df
-        
+        field_alias_map = field_alias_map or {}
+
         # 为每个字段映射添加期望值列
         for fm in mapping.field_mappings:
             expected_col = f"_expected_{fm.target_field}"
-            
+
             if fm.source_field:
-                # 直接映射
-                df = df.withColumn(expected_col, col(fm.source_field))
-            
+                # 直接映射 - 获取实际列名
+                actual_col = field_alias_map.get(fm.source_field, fm.source_field)
+                if '.' in fm.source_field and fm.source_field not in field_alias_map:
+                    actual_col = fm.source_field.split('.')[-1]
+                df = df.withColumn(expected_col, col(actual_col))
+
             elif fm.transform:
                 # 需要转换
-                df = self.apply_transform(df, fm.transform, mapping.field_mappings)
+                df = self.apply_transform(df, fm.transform, field_alias_map)
                 transform_type = fm.transform.get('type')
                 transform_col = f"_transformed_{transform_type}"
                 df = df.withColumn(expected_col, col(transform_col))
                 df = df.drop(transform_col)  # 清理临时列
-        
+
         return df
-    
+
     def validate_table(self, mapping: TableMapping) -> ValidationResult:
         """校验单表数据 (优化: 单次 FULL JOIN + 聚合统计)"""
+        # 构建源表描述 (支持多表 JOIN)
+        if mapping.is_multi_source():
+            source_desc = "JOIN(".join(st.alias for st in mapping.source_tables) + ")"
+        else:
+            source_desc = mapping.source_table or "unknown"
+
         result = ValidationResult(
-            table_name=f"{mapping.source_table} -> {mapping.target_table}"
+            table_name=f"{source_desc} -> {mapping.target_table}"
         )
         start_time = datetime.now()
-        
+
         try:
-            logger.info(f"读取源表: {mapping.source_table}")
-            source_df = self.read_source_table(mapping)
-            
+            logger.info(f"读取源表: {source_desc}")
+            source_df, field_alias_map = self.read_source_table(mapping)
+
             logger.info(f"读取目标表: {mapping.target_table}")
             target_df = self.read_target_table(mapping)
-            
+
             # 构建源 DataFrame（包含期望值）
-            source_with_expected = self.build_source_df(source_df, mapping)
-            
+            source_with_expected = self.build_source_df(source_df, mapping, field_alias_map)
+
             # 获取主键字段
             pk_fields = [fm.target_field for fm in mapping.field_mappings if fm.is_primary_key]
             if not pk_fields:
-                logger.warning(f"表 {mapping.source_table} 没有配置主键，使用全部字段")
+                logger.warning(f"表 {source_desc} 没有配置主键，使用全部字段")
                 pk_fields = [fm.target_field for fm in mapping.field_mappings]
-            
+
             # 构建主键列 - 使用 struct 更安全 (避免分隔符冲突)
             source_pk_cols = [col(f"_expected_{f}") for f in pk_fields]
             target_pk_cols = [col(f) for f in pk_fields]
@@ -725,16 +1018,16 @@ class SparkDataValidator:
                         'key': key_value,
                         'failed_checks': failed_checks
                     })
-            
+
             # 清理缓存
             source_with_expected.unpersist()
             target_df.unpersist()
-            
+
             result.status = "completed"
-            logger.info(f"完成表 {mapping.source_table} 校验")
-            
+            logger.info(f"完成表 {source_desc} 校验")
+
         except Exception as e:
-            logger.error(f"校验表 {mapping.source_table} 时出错: {e}")
+            logger.error(f"校验表 {source_desc} 时出错: {e}")
             result.status = "error"
             result.errors.append({
                 'type': 'exception',
@@ -747,12 +1040,35 @@ class SparkDataValidator:
     def run_validation(self) -> List[ValidationResult]:
         """运行全部校验"""
         tables = self.config.get('tables', [])
-        
+
         for table_config in tables:
             mapping = self.load_table_mapping(table_config)
+
+            # 验证配置
+            validation_errors = self.validate_table_mapping(mapping)
+            if validation_errors:
+                # 配置验证失败，创建错误结果
+                if mapping.is_multi_source():
+                    source_desc = "JOIN(".join(st.alias for st in mapping.source_tables) + ")"
+                else:
+                    source_desc = mapping.source_table or "unknown"
+
+                result = ValidationResult(
+                    table_name=f"{source_desc} -> {mapping.target_table}",
+                    status="error"
+                )
+                for err in validation_errors:
+                    result.errors.append({
+                        'type': 'config_validation',
+                        'error': err
+                    })
+                    logger.error(f"配置验证失败: {err}")
+                self.results.append(result)
+                continue
+
             result = self.validate_table(mapping)
             self.results.append(result)
-        
+
         return self.results
     
     def generate_report(self, output_dir: str = None, formats: List[str] = None):

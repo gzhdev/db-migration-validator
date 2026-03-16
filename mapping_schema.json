@@ -41,11 +41,47 @@
       "description": "表映射配置列表",
       "items": {
         "type": "object",
-        "required": ["source_table", "target_table", "field_mappings"],
+        "required": ["target_table", "field_mappings"],
+        "oneOf": [
+          { "required": ["source_table"] },
+          { "required": ["source_tables"] }
+        ],
         "properties": {
           "source_table": {
             "type": "string",
-            "description": "源表名"
+            "description": "源表名（单表模式）"
+          },
+          "source_tables": {
+            "type": "array",
+            "description": "多表 JOIN 源表配置（多表模式）",
+            "items": {
+              "type": "object",
+              "required": ["table_name", "alias"],
+              "properties": {
+                "table_name": {
+                  "type": "string",
+                  "description": "源表名"
+                },
+                "alias": {
+                  "type": "string",
+                  "description": "表别名（在字段映射中引用）"
+                },
+                "schema": {
+                  "type": "string",
+                  "description": "源表 schema"
+                },
+                "join_type": {
+                  "type": "string",
+                  "enum": ["primary", "inner", "left", "right", "full", "cross"],
+                  "default": "inner",
+                  "description": "JOIN 类型，第一个表使用 'primary'"
+                },
+                "join_condition": {
+                  "type": "string",
+                  "description": "JOIN 条件（第一个表除外，必需）"
+                }
+              }
+            }
           },
           "target_table": {
             "type": "string",
@@ -53,7 +89,7 @@
           },
           "source_schema": {
             "type": "string",
-            "description": "源表 schema（如 PostgreSQL 的 schema）"
+            "description": "源表 schema（如 PostgreSQL 的 schema，单表模式）"
           },
           "target_schema": {
             "type": "string",
@@ -62,6 +98,14 @@
           "description": {
             "type": "string",
             "description": "映射说明"
+          },
+          "table_filters": {
+            "type": "object",
+            "description": "多表模式下各表的过滤条件（key 为表别名）",
+            "additionalProperties": {
+              "type": "string",
+              "description": "SQL WHERE 子句"
+            }
           },
           "field_mappings": {
             "type": "array",
@@ -80,7 +124,7 @@
                 },
                 "source_field": {
                   "type": "string",
-                  "description": "源表字段名（直接映射时使用）"
+                  "description": "源表字段名（直接映射时使用，多表模式支持 alias.field 格式）"
                 },
                 "transform": {
                   "type": "object",
@@ -101,7 +145,7 @@
                     "fields": {
                       "type": "array",
                       "items": { "type": "string" },
-                      "description": "参与转换的源字段列表"
+                      "description": "参与转换的源字段列表（多表模式支持 alias.field 格式）"
                     },
                     "separator": {
                       "type": "string",
@@ -153,7 +197,7 @@
                     },
                     "expression": {
                       "type": "string",
-                      "description": "math/custom 转换的表达式"
+                      "description": "math/custom 转换的表达式（多表模式支持 alias.field 格式）"
                     },
                     "cast_type": {
                       "type": "string",
@@ -174,7 +218,7 @@
                 "nullable": {
                   "type": "boolean",
                   "default": true,
-                  "description": "是否允许为空"
+                  "description": "是否允许为空（用于取值范围校验）"
                 },
                 "compare_rule": {
                   "type": "string",
@@ -189,13 +233,34 @@
                 "description": {
                   "type": "string",
                   "description": "字段映射说明"
+                },
+                "min_value": {
+                  "type": "number",
+                  "description": "取值范围校验：最小值"
+                },
+                "max_value": {
+                  "type": "number",
+                  "description": "取值范围校验：最大值"
+                },
+                "allowed_values": {
+                  "type": "array",
+                  "description": "取值范围校验：允许值列表",
+                  "items": {}
+                },
+                "pattern": {
+                  "type": "string",
+                  "description": "取值范围校验：正则表达式"
+                },
+                "value_check_expr": {
+                  "type": "string",
+                  "description": "取值范围校验：自定义 Spark SQL 表达式"
                 }
               }
             }
           },
           "filters": {
             "type": "object",
-            "description": "数据过滤条件",
+            "description": "数据过滤条件（单表模式）",
             "properties": {
               "source_filter": {
                 "type": "string",

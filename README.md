@@ -12,6 +12,7 @@
 ## 功能特性
 
 - **灵活的字段映射**: 支持直接映射、字段转换、条件映射等多种方式
+- **多表 JOIN 支持**: Spark版支持多张源表 JOIN 后与目标表比对
 - **多种比较规则**: 精确比较、忽略大小写、忽略空白、数值容差、跳过比较
 - **取值范围校验**: 支持最小/最大值、允许值列表、正则表达式、自定义表达式校验
 - **多数据库支持**: MySQL、PostgreSQL、SQLite（可扩展 Oracle、SQL Server）
@@ -186,17 +187,19 @@ python-oracledb 支持两种模式：
 
 | 字段 | 必填 | 说明 |
 |------|------|------|
-| `source_table` | 是 | 源表名 |
+| `source_table` | 二选一 | 源表名（单表模式，与 source_tables 二选一） |
+| `source_tables` | 二选一 | 多表 JOIN 配置（多表模式，与 source_table 二选一） |
 | `target_table` | 是 | 目标表名 |
-| `source_schema` | 否 | 源表 schema（PostgreSQL） |
+| `source_schema` | 否 | 源表 schema（PostgreSQL，单表模式） |
 | `target_schema` | 否 | 目标表 schema |
 | `description` | 否 | 映射说明 |
 | `field_mappings` | 是 | 字段映射列表（见下文） |
-| `filters` | 否 | 过滤条件 |
+| `filters` | 否 | 过滤条件（单表模式） |
+| `table_filters` | 否 | 各表过滤条件（多表模式） |
 | `sample_size` | 否 | 抽样数量，0 表示全量 |
 | `batch_size` | 否 | 批量大小，默认 1000 |
 
-示例：
+#### 2.1 单表模式示例
 
 ```json
 {
@@ -212,6 +215,80 @@ python-oracledb 支持两种模式：
   "sample_size": 10000
 }
 ```
+
+#### 2.2 多表 JOIN 模式（Spark版）
+
+当目标表数据来自多张源表 JOIN 时，使用 `source_tables` 配置：
+
+```json
+{
+  "source_tables": [
+    {
+      "table_name": "orders",
+      "alias": "o",
+      "join_type": "primary"
+    },
+    {
+      "table_name": "users",
+      "alias": "u",
+      "join_type": "left",
+      "join_condition": "o.user_id = u.id"
+    },
+    {
+      "table_name": "products",
+      "alias": "p",
+      "join_type": "inner",
+      "join_condition": "o.product_id = p.id"
+    }
+  ],
+  "table_filters": {
+    "o": "o.deleted_at IS NULL",
+    "u": "u.status = 'active'"
+  },
+  "target_table": "order_detail",
+  "field_mappings": [
+    {
+      "target_field": "order_id",
+      "source_field": "o.id",
+      "is_primary_key": true
+    },
+    {
+      "target_field": "customer_name",
+      "source_field": "u.name",
+      "nullable": true
+    },
+    {
+      "target_field": "total_amount",
+      "transform": {
+        "type": "math",
+        "fields": ["o.price", "o.quantity"],
+        "expression": "o.price * o.quantity"
+      }
+    }
+  ]
+}
+```
+
+**多表 JOIN 配置说明**：
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `table_name` | 是 | 源表名 |
+| `alias` | 是 | 表别名，用于字段引用（如 `o.id`） |
+| `schema` | 否 | 源表 schema |
+| `join_type` | 否 | JOIN 类型：`primary`（第一个表）、`inner`、`left`、`right`、`full`、`cross` |
+| `join_condition` | 条件 | JOIN 条件（第一个表除外，必需） |
+
+**字段引用格式**：在多表模式下，字段使用 `alias.field` 格式引用：
+- `source_field`: `"o.id"`, `"u.name"`
+- `transform.fields`: `["o.price", "o.quantity"]`
+- `transform.expression`: `"o.price * o.quantity"`
+
+**注意事项**：
+- 多表 JOIN 模式不支持并行分区读取
+- Oracle 数据库不支持 `AS` 别名语法，工具已自动处理
+- LEFT/FULL JOIN 可能产生 NULL 值，需正确配置 `nullable`
+- 复杂 JOIN 建议在数据库层面创建视图
 
 ### 3. 字段映射配置
 
@@ -498,7 +575,7 @@ python-oracledb 支持两种模式：
 
 ```json
 {
-  "version": "1.0",
+  "version": "1.1",
   "source_db": {
     "type": "mysql",
     "host": "192.168.1.100",
