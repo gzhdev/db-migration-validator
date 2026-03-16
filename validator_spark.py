@@ -556,33 +556,39 @@ class SparkDataValidator:
                 for fm in value_check_fields:
                     check_col = f"_value_check_{fm.target_field}"
                     actual_col = f"t.{fm.target_field}"  # 使用表别名避免歧义
-                    check_expr = lit(True)
+
+                    # 构建非 NULL 值的校验表达式
+                    non_null_check_expr = lit(True)
 
                     # 最小值校验
                     if fm.min_value is not None:
-                        check_expr = check_expr & (col(actual_col) >= fm.min_value)
+                        non_null_check_expr = non_null_check_expr & (col(actual_col) >= fm.min_value)
 
                     # 最大值校验
                     if fm.max_value is not None:
-                        check_expr = check_expr & (col(actual_col) <= fm.max_value)
+                        non_null_check_expr = non_null_check_expr & (col(actual_col) <= fm.max_value)
 
                     # 允许值列表校验
                     if fm.allowed_values:
-                        check_expr = check_expr & col(actual_col).isin(fm.allowed_values)
+                        non_null_check_expr = non_null_check_expr & col(actual_col).isin(fm.allowed_values)
 
                     # 正则表达式校验
                     if fm.pattern:
-                        check_expr = check_expr & col(actual_col).rlike(fm.pattern)
+                        non_null_check_expr = non_null_check_expr & col(actual_col).rlike(fm.pattern)
 
                     # 自定义表达式校验
                     if fm.value_check_expr:
                         # 替换字段名，添加表别名
                         custom_expr = fm.value_check_expr.replace(fm.target_field, f"`t`.`{fm.target_field}`")
-                        check_expr = check_expr & expr(custom_expr)
+                        non_null_check_expr = non_null_check_expr & expr(custom_expr)
 
-                    # NULL 值处理：如果字段不允许为空且值为 NULL，则校验失败
-                    if not fm.nullable:
-                        check_expr = check_expr & col(actual_col).isNotNull()
+                    # 组合最终校验表达式：NULL 值处理
+                    if fm.nullable:
+                        # 允许 NULL：NULL 值直接通过，非 NULL 值需要校验
+                        check_expr = col(actual_col).isNull() | non_null_check_expr
+                    else:
+                        # 不允许 NULL：必须非空且通过校验
+                        check_expr = col(actual_col).isNotNull() & non_null_check_expr
 
                     classified_df = classified_df.withColumn(check_col, check_expr)
 
@@ -648,10 +654,12 @@ class SparkDataValidator:
                     mismatched_fields = []
                     for fm in mapping.field_mappings:
                         if not row[f"_cmp_{fm.target_field}"]:
+                            expected_val = row[f"_expected_{fm.target_field}"]
+                            actual_val = row[fm.target_field]
                             mismatched_fields.append({
                                 'field': fm.target_field,
-                                'expected': str(row[f"_expected_{fm.target_field}"]),
-                                'actual': str(row[fm.target_field])
+                                'expected': str(expected_val) if expected_val is not None else 'NULL',
+                                'actual': str(actual_val) if actual_val is not None else 'NULL'
                             })
 
                     result.errors.append({
@@ -682,20 +690,26 @@ class SparkDataValidator:
                             elif fm.target_field in row_fields:
                                 field_value = row[fm.target_field]
 
-                            if fm.min_value is not None and field_value is not None and field_value < fm.min_value:
-                                check_reasons.append(f"小于最小值 {fm.min_value}")
-                            if fm.max_value is not None and field_value is not None and field_value > fm.max_value:
-                                check_reasons.append(f"大于最大值 {fm.max_value}")
-                            if fm.allowed_values and field_value not in fm.allowed_values:
-                                check_reasons.append(f"不在允许值列表中 {fm.allowed_values}")
-                            if fm.pattern and field_value and not __import__('re').match(fm.pattern, str(field_value)):
-                                check_reasons.append(f"不匹配正则 {fm.pattern}")
-                            if fm.value_check_expr:
-                                check_reasons.append(f"不满足条件 {fm.value_check_expr}")
+                            # NULL 值处理
+                            if field_value is None:
+                                if not fm.nullable:
+                                    check_reasons.append("字段不允许为空")
+                            else:
+                                # 非 NULL 值的校验
+                                if fm.min_value is not None and field_value < fm.min_value:
+                                    check_reasons.append(f"小于最小值 {fm.min_value}")
+                                if fm.max_value is not None and field_value > fm.max_value:
+                                    check_reasons.append(f"大于最大值 {fm.max_value}")
+                                if fm.allowed_values and field_value not in fm.allowed_values:
+                                    check_reasons.append(f"不在允许值列表中 {fm.allowed_values}")
+                                if fm.pattern and not __import__('re').match(fm.pattern, str(field_value)):
+                                    check_reasons.append(f"不匹配正则 {fm.pattern}")
+                                if fm.value_check_expr:
+                                    check_reasons.append(f"不满足条件 {fm.value_check_expr}")
 
                             failed_checks.append({
                                 'field': fm.target_field,
-                                'value': str(field_value),
+                                'value': str(field_value) if field_value is not None else 'NULL',
                                 'reasons': check_reasons
                             })
 
