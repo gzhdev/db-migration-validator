@@ -567,26 +567,53 @@ python-oracledb 支持两种模式：
     "report_format": ["json", "html", "markdown"],
     "debug": {
       "enabled": true,
-      "output_file": "./debug/comparison_debug.md",
-      "max_records": 1000,
-      "include_matched": false
+      "output_dir": "./debug",
+      "formats": ["jsonl", "html"],
+      "max_records": 10000,
+      "record_types": {
+        "matched": false,
+        "mismatched": true,
+        "missing_in_source": true,
+        "missing_in_target": true,
+        "value_check_failed": true
+      },
+      "data_content": {
+        "include_raw_source": true,
+        "include_expected": true,
+        "include_target": true
+      }
     }
   }
 }
 ```
 
-### 9. Debug 模式
+### 9. Debug 模式（Spark版）
 
-启用 debug 模式可以记录详细的比对过程，便于排查数据不一致问题。
+启用 debug 模式可以记录详细的比对过程，包含**三层数据**（原始数据、期望值、目标值），便于排查数据不一致问题。
+
+#### 9.1 配置说明
 
 ```json
 {
   "global_settings": {
     "debug": {
       "enabled": true,
-      "output_file": "./debug/comparison_debug.md",
-      "max_records": 1000,
-      "include_matched": false
+      "output_dir": "./debug",
+      "formats": ["jsonl", "html"],
+      "max_records": 10000,
+      "buffer_size": 1000,
+      "record_types": {
+        "matched": false,
+        "mismatched": true,
+        "missing_in_source": true,
+        "missing_in_target": true,
+        "value_check_failed": true
+      },
+      "data_content": {
+        "include_raw_source": true,
+        "include_expected": true,
+        "include_target": true
+      }
     }
   }
 }
@@ -595,57 +622,72 @@ python-oracledb 支持两种模式：
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `enabled` | bool | false | 是否启用 debug 模式 |
-| `output_file` | string | `./debug/comparison_debug.md` | debug 日志文件路径 |
-| `max_records` | int | 1000 | 每个表最多记录的比对条数，**0 表示不限制** |
-| `include_matched` | bool | false | 是否包含完全匹配的记录 |
+| `output_dir` | string | `./debug` | debug 输出目录 |
+| `formats` | array | `["jsonl", "html"]` | 输出格式 |
+| `max_records` | int | 10000 | 最多记录的比对条数，**0 表示不限制** |
+| `buffer_size` | int | 1000 | JSONL 写入缓冲区大小 |
 
-**Debug 日志输出示例**：
+**记录类型配置** (`record_types`):
 
-```markdown
-# 数据比对 Debug 日志
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `matched` | false | 完全匹配的记录 |
+| `mismatched` | true | 字段不匹配的记录 |
+| `missing_in_source` | true | 源表缺失的记录 |
+| `missing_in_target` | true | 目标表缺失的记录 |
+| `value_check_failed` | true | 取值范围校验失败的记录 |
 
-生成时间: 2026-03-16 17:30:00
+**数据内容配置** (`data_content`):
 
----
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `include_raw_source` | true | 包含原始源表数据 |
+| `include_expected` | true | 包含转换后的期望值 |
+| `include_target` | true | 包含目标表实际值 |
 
-## 表: users -> user_profile
+#### 9.2 输出格式
 
-### 统计摘要
-- 总记录数: 9207
-- 完全匹配: 9200
-- 字段不匹配: 5
-- 源表缺失: 1
-- 目标表缺失: 1
+**JSONL 格式** (数据导出，每行一个 JSON 对象):
 
-### 比对记录详情
-
-#### 字段不匹配记录 (5条)
-
-| 主键 | 字段 | 期望值 | 实际值 |
-|------|------|--------|--------|
-| {id: 123} | status | "active" | "inactive" |
-| {id: 456} | amount | 100.00 | 99.99 |
-
-#### 目标表缺失记录 (1条)
-
-| 主键 |
-|------|
-| {id: 789} |
-
-#### 源表缺失记录 (1条)
-
-| 主键 |
-|------|
-| {id: 999} |
-
----
+```jsonl
+{"record_id":"001_000001","primary_key":{"id":123},"match_type":"mismatched","raw_source":{"id":123,"first_name":"John","last_name":"Doe"},"expected_values":{"user_id":123,"full_name":"John Doe"},"target_values":{"user_id":123,"full_name":"Johnny Doe"},"comparison_result":{"full_name":{"match":false,"expected":"John Doe","actual":"Johnny Doe"}}}
 ```
 
-**注意事项**：
-- `max_records` 限制每个表记录的最大条数，**设为 0 表示不限制**（可能导致文件过大）
-- `include_matched: true` 会记录所有完全匹配的记录，数据量可能很大
+**HTML 格式** (交互式报告):
+- 三列并排展示：原始数据 | 期望值 | 目标值
+- 不匹配字段高亮显示
+- 支持按类型过滤（mismatched/missing/value_check_failed）
+- 支持关键词搜索
+
+#### 9.3 输出目录结构
+
+```
+./debug/
+├── debug_report_20260317.html      # HTML 交互式报告
+├── users_to_profile/               # 每个表一个目录
+│   ├── records.jsonl               # JSONL 数据文件
+│   └── summary.json                # 表级统计
+└── orders_to_order/
+    ├── records.jsonl
+    └── summary.json
+```
+
+#### 9.4 HTML 报告示例
+
+HTML 报告提供交互式界面：
+- **总览面板**: 显示校验表数、debug 记录数、各类统计
+- **表详情**: 可折叠展开每个表的详细记录
+- **三列对比**: 原始数据（蓝色）、期望值（绿色）、目标值（橙色）
+- **差异高亮**: 不匹配字段在 comparison_result 区域显示
+- **过滤搜索**: 按记录类型过滤，支持关键词搜索
+
+#### 9.5 注意事项
+
+- `max_records` 限制记录的最大条数，**设为 0 表示不限制**（可能导致文件过大）
+- `record_types.matched: true` 会记录所有完全匹配的记录，数据量可能很大
 - debug 模式会影响性能，建议仅在排查问题时启用
-- debug 日志可能包含敏感数据，注意文件权限
+- debug 输出可能包含敏感数据，注意文件权限和存储位置
+- JSONL 格式支持流式写入，大数据量时内存效率更高
 
 ---
 
@@ -727,9 +769,21 @@ python-oracledb 支持两种模式：
     "report_format": ["json", "markdown"],
     "debug": {
       "enabled": false,
-      "output_file": "./debug/comparison_debug.md",
-      "max_records": 1000,
-      "include_matched": false
+      "output_dir": "./debug",
+      "formats": ["jsonl", "html"],
+      "max_records": 10000,
+      "record_types": {
+        "matched": false,
+        "mismatched": true,
+        "missing_in_source": true,
+        "missing_in_target": true,
+        "value_check_failed": true
+      },
+      "data_content": {
+        "include_raw_source": true,
+        "include_expected": true,
+        "include_target": true
+      }
     }
   }
 }

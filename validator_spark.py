@@ -6,6 +6,7 @@ Database Migration Data Consistency Validator - Spark Version
 使用 PySpark 进行分布式计算，支持大数据量的迁移校验。
 """
 
+import decimal
 import json
 import logging
 import os
@@ -27,186 +28,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class DebugLogger:
-    """Debug 日志记录器 - 记录详细的比对过程到 Markdown 文件"""
-
-    def __init__(self, enabled: bool = False, output_file: str = "./debug/comparison_debug.md",
-                 max_records: int = 1000, include_matched: bool = False):
-        self.enabled = enabled
-        self.output_file = output_file
-        self.max_records = max_records
-        self.include_matched = include_matched
-        self._file = None
-        self._current_table = None
-        self._record_count = 0
-        self._records = {
-            'matched': [],
-            'mismatched': [],
-            'missing_in_source': [],
-            'missing_in_target': [],
-            'value_check_failed': []
-        }
-
-    def start_log(self):
-        """开始记录 debug 日志"""
-        if not self.enabled:
-            return
-
-        # 创建输出目录
-        output_path = Path(self.output_file)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        self._file = open(self.output_file, 'w', encoding='utf-8')
-        self._file.write("# 数据比对 Debug 日志\n\n")
-        self._file.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-        self._file.write("---\n\n")
-
-    def start_table(self, source_name: str, target_name: str):
-        """开始记录表的比对"""
-        if not self.enabled or not self._file:
-            return
-
-        self._current_table = f"{source_name} -> {target_name}"
-        self._record_count = 0
-        self._records = {
-            'matched': [],
-            'mismatched': [],
-            'missing_in_source': [],
-            'missing_in_target': [],
-            'value_check_failed': []
-        }
-
-    def log_comparison(self, pk: Any, match_type: str, details: Dict[str, Any] = None):
-        """
-        记录单条比对结果
-
-        Args:
-            pk: 主键值
-            match_type: 比对类型 (matched, mismatched, missing_in_source, missing_in_target, value_check_failed)
-            details: 详细信息
-        """
-        if not self.enabled or (self.max_records > 0 and self._record_count >= self.max_records):
-            return
-
-        # 只记录非匹配记录，除非配置了 include_matched
-        if match_type == 'matched' and not self.include_matched:
-            return
-
-        record = {
-            'pk': pk,
-            'details': details or {}
-        }
-
-        if match_type in self._records:
-            self._records[match_type].append(record)
-            self._record_count += 1
-
-    def end_table(self, stats: Dict[str, int]):
-        """结束表的比对，写入统计和详情"""
-        if not self.enabled or not self._file or not self._current_table:
-            return
-
-        self._file.write(f"## 表: {self._current_table}\n\n")
-
-        # 写入统计摘要
-        self._file.write("### 统计摘要\n\n")
-        self._file.write(f"- 总记录数: {stats.get('total_rows', 0)}\n")
-        self._file.write(f"- 完全匹配: {stats.get('matched_rows', 0)}\n")
-        self._file.write(f"- 字段不匹配: {stats.get('mismatched_rows', 0)}\n")
-        self._file.write(f"- 源表缺失: {stats.get('missing_in_source', 0)}\n")
-        self._file.write(f"- 目标表缺失: {stats.get('missing_in_target', 0)}\n")
-        if stats.get('value_check_failed', 0) > 0:
-            self._file.write(f"- 取值范围失败: {stats.get('value_check_failed', 0)}\n")
-        self._file.write("\n")
-
-        # 写入比对记录详情
-        self._file.write("### 比对记录详情\n\n")
-
-        # 字段不匹配记录
-        if self._records['mismatched']:
-            self._file.write(f"#### 字段不匹配记录 ({len(self._records['mismatched'])}条)\n\n")
-            self._file.write("| 主键 | 字段 | 期望值 | 实际值 |\n")
-            self._file.write("|------|------|--------|--------|\n")
-            for record in self._records['mismatched']:
-                pk_str = self._format_pk(record['pk'])
-                for field_err in record['details'].get('mismatched_fields', []):
-                    self._file.write(f"| {pk_str} | {field_err['field']} | "
-                                   f"{self._format_value(field_err['expected'])} | "
-                                   f"{self._format_value(field_err['actual'])} |\n")
-            self._file.write("\n")
-
-        # 目标表缺失记录
-        if self._records['missing_in_target']:
-            self._file.write(f"#### 目标表缺失记录 ({len(self._records['missing_in_target'])}条)\n\n")
-            self._file.write("| 主键 |\n")
-            self._file.write("|------|\n")
-            for record in self._records['missing_in_target']:
-                pk_str = self._format_pk(record['pk'])
-                self._file.write(f"| {pk_str} |\n")
-            self._file.write("\n")
-
-        # 源表缺失记录
-        if self._records['missing_in_source']:
-            self._file.write(f"#### 源表缺失记录 ({len(self._records['missing_in_source'])}条)\n\n")
-            self._file.write("| 主键 |\n")
-            self._file.write("|------|\n")
-            for record in self._records['missing_in_source']:
-                pk_str = self._format_pk(record['pk'])
-                self._file.write(f"| {pk_str} |\n")
-            self._file.write("\n")
-
-        # 取值范围校验失败记录
-        if self._records['value_check_failed']:
-            self._file.write(f"#### 取值范围校验失败记录 ({len(self._records['value_check_failed'])}条)\n\n")
-            self._file.write("| 主键 | 字段 | 值 | 失败原因 |\n")
-            self._file.write("|------|------|-----|----------|\n")
-            for record in self._records['value_check_failed']:
-                pk_str = self._format_pk(record['pk'])
-                for check_err in record['details'].get('failed_checks', []):
-                    reasons = ", ".join(check_err.get('reasons', []))
-                    self._file.write(f"| {pk_str} | {check_err['field']} | "
-                                   f"{self._format_value(check_err['value'])} | {reasons} |\n")
-            self._file.write("\n")
-
-        # 完全匹配记录（如果配置了 include_matched）
-        if self._records['matched']:
-            self._file.write(f"#### 完全匹配记录 ({len(self._records['matched'])}条)\n\n")
-            self._file.write("| 主键 |\n")
-            self._file.write("|------|\n")
-            for record in self._records['matched'][:20]:  # 最多显示20条
-                pk_str = self._format_pk(record['pk'])
-                self._file.write(f"| {pk_str} |\n")
-            if len(self._records['matched']) > 20:
-                self._file.write(f"\n*...共 {len(self._records['matched'])} 条记录*\n")
-            self._file.write("\n")
-
-        self._file.write("---\n\n")
-        self._file.flush()
-
-    def _format_pk(self, pk: Any) -> str:
-        """格式化主键值"""
-        if pk is None:
-            return "NULL"
-        pk_str = str(pk)
-        # 处理 Row 对象的显示
-        if pk_str.startswith('Row('):
-            # 简化 Row 显示
-            return pk_str.replace('Row(', '{').replace(')', '}').replace('=', ': ')
-        return pk_str
-
-    def _format_value(self, value: Any) -> str:
-        """格式化字段值"""
-        if value is None:
-            return "NULL"
-        return str(value).replace("|", "\\|").replace("\n", "\\n")[:100]  # 限制长度
-
-    def close(self):
-        """关闭日志文件"""
-        if self._file:
-            self._file.write(f"\n*日志生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n")
-            self._file.close()
-            self._file = None
-            logger.info(f"Debug 日志已保存: {self.output_file}")
+def _fmt_value(value: Any) -> str:
+    """将值转换为字符串，浮点数使用定点表示避免科学计数法"""
+    if value is None:
+        return 'NULL'
+    if isinstance(value, float):
+        return format(decimal.Decimal(repr(value)), 'f')
+    if isinstance(value, decimal.Decimal):
+        return format(value, 'f')
+    return str(value)
 
 
 @dataclass
@@ -277,6 +107,811 @@ class ValidationResult:
     status: str = "pending"
 
 
+@dataclass
+class DebugConfig:
+    """Debug 配置"""
+    enabled: bool = False
+    output_dir: str = "./debug"
+    formats: List[str] = field(default_factory=lambda: ["jsonl", "html"])
+    max_records: int = 10000
+    # record types
+    include_matched: bool = False
+    include_mismatched: bool = True
+    include_missing: bool = True
+    include_value_check_failed: bool = True
+    # data content
+    include_raw_source: bool = True
+    include_expected: bool = True
+    include_target: bool = True
+    buffer_size: int = 1000
+
+    @classmethod
+    def from_dict(cls, config: Dict[str, Any]) -> 'DebugConfig':
+        """从配置字典创建 DebugConfig"""
+        if not config:
+            return cls()
+
+        record_types = config.get('record_types', {})
+        data_content = config.get('data_content', {})
+
+        return cls(
+            enabled=config.get('enabled', False),
+            output_dir=config.get('output_dir', './debug'),
+            formats=config.get('formats', ['jsonl', 'html']),
+            max_records=config.get('max_records', 10000),
+            include_matched=record_types.get('matched', False),
+            include_mismatched=record_types.get('mismatched', True),
+            include_missing=record_types.get('missing_in_source', True) and record_types.get('missing_in_target', True),
+            include_value_check_failed=record_types.get('value_check_failed', True),
+            include_raw_source=data_content.get('include_raw_source', True),
+            include_expected=data_content.get('include_expected', True),
+            include_target=data_content.get('include_target', True),
+            buffer_size=config.get('buffer_size', 1000)
+        )
+
+
+@dataclass
+class DebugRecord:
+    """单条 debug 记录"""
+    record_id: str
+    primary_key: Dict[str, Any]
+    match_type: str  # matched, mismatched, missing_in_source, missing_in_target, value_check_failed
+    raw_source: Dict[str, Any] = field(default_factory=dict)
+    expected_values: Dict[str, Any] = field(default_factory=dict)
+    target_values: Dict[str, Any] = field(default_factory=dict)
+    comparison_result: Dict[str, Any] = field(default_factory=dict)
+    value_check_failures: List[Dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典"""
+        return {
+            'record_id': self.record_id,
+            'primary_key': self.primary_key,
+            'match_type': self.match_type,
+            'raw_source': self.raw_source,
+            'expected_values': self.expected_values,
+            'target_values': self.target_values,
+            'comparison_result': self.comparison_result,
+            'value_check_failures': self.value_check_failures
+        }
+
+
+class JsonlWriter:
+    """流式 JSONL 写入器"""
+
+    def __init__(self, output_path: str, buffer_size: int = 1000):
+        self.output_path = output_path
+        self.buffer_size = buffer_size
+        self._buffer: List[Dict[str, Any]] = []
+        self._file = None
+        self._record_count = 0
+
+    def open(self):
+        """打开文件"""
+        Path(self.output_path).parent.mkdir(parents=True, exist_ok=True)
+        self._file = open(self.output_path, 'w', encoding='utf-8')
+        self._buffer = []
+        self._record_count = 0
+
+    def write_record(self, record: Dict[str, Any]):
+        """写入单条记录 (带缓冲)"""
+        if not self._file:
+            self.open()
+
+        self._buffer.append(record)
+        self._record_count += 1
+
+        if len(self._buffer) >= self.buffer_size:
+            self.flush()
+
+    def flush(self):
+        """刷新缓冲区到文件"""
+        if self._file and self._buffer:
+            for record in self._buffer:
+                self._file.write(json.dumps(record, ensure_ascii=False, default=str) + '\n')
+            self._file.flush()
+            self._buffer = []
+
+    def close(self):
+        """关闭文件"""
+        self.flush()
+        if self._file:
+            self._file.close()
+            self._file = None
+        logger.info(f"JSONL 文件已保存: {self.output_path} ({self._record_count} 条记录)")
+
+    @property
+    def record_count(self) -> int:
+        return self._record_count
+
+
+class HtmlReportGenerator:
+    """HTML 报告生成器"""
+
+    def __init__(self, output_path: str):
+        self.output_path = output_path
+        self._tables: Dict[str, Dict[str, Any]] = {}  # table_name -> {records, stats}
+
+    def add_table_records(self, table_name: str, records: List[Dict[str, Any]], stats: Dict[str, int]):
+        """添加表的记录和统计"""
+        self._tables[table_name] = {
+            'records': records,
+            'stats': stats
+        }
+
+    def generate(self):
+        """生成 HTML 报告"""
+        Path(self.output_path).parent.mkdir(parents=True, exist_ok=True)
+
+        html_content = self._generate_html()
+        with open(self.output_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+
+        logger.info(f"HTML 报告已生成: {self.output_path}")
+
+    def _generate_html(self) -> str:
+        """生成完整 HTML 内容"""
+        return f'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Debug Report - 数据比对详细报告</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; padding: 20px; }}
+        .container {{ max-width: 1400px; margin: 0 auto; }}
+        h1 {{ color: #333; margin-bottom: 20px; padding-bottom: 10px; border-bottom: 2px solid #4CAF50; }}
+        .summary {{ background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        .summary h2 {{ color: #333; margin-bottom: 15px; }}
+        .summary-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }}
+        .summary-item {{ background: #f8f9fa; padding: 15px; border-radius: 6px; text-align: center; }}
+        .summary-item .value {{ font-size: 24px; font-weight: bold; color: #4CAF50; }}
+        .summary-item .label {{ color: #666; font-size: 14px; }}
+        .table-section {{ background: white; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); overflow: hidden; }}
+        .table-header {{ background: #f8f9fa; padding: 15px 20px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }}
+        .table-header:hover {{ background: #e9ecef; }}
+        .table-header h3 {{ color: #333; }}
+        .table-stats {{ display: flex; gap: 20px; font-size: 14px; color: #666; }}
+        .table-stats span {{ padding: 2px 8px; border-radius: 4px; }}
+        .stat-matched {{ background: #d4edda; color: #155724; }}
+        .stat-mismatched {{ background: #f8d7da; color: #721c24; }}
+        .stat-missing {{ background: #fff3cd; color: #856404; }}
+        .table-content {{ padding: 20px; display: none; }}
+        .table-content.active {{ display: block; }}
+        .filter-bar {{ margin-bottom: 15px; display: flex; gap: 10px; flex-wrap: wrap; }}
+        .filter-btn {{ padding: 8px 16px; border: 1px solid #ddd; background: white; border-radius: 4px; cursor: pointer; }}
+        .filter-btn.active {{ background: #4CAF50; color: white; border-color: #4CAF50; }}
+        .search-box {{ padding: 8px 12px; border: 1px solid #ddd; border-radius: 4px; width: 200px; }}
+        .record {{ border: 1px solid #e0e0e0; border-radius: 6px; margin-bottom: 15px; overflow: hidden; }}
+        .record-header {{ background: #f8f9fa; padding: 10px 15px; display: flex; justify-content: space-between; align-items: center; }}
+        .record-type {{ padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: bold; }}
+        .type-matched {{ background: #d4edda; color: #155724; }}
+        .type-mismatched {{ background: #f8d7da; color: #721c24; }}
+        .type-missing_in_source {{ background: #fff3cd; color: #856404; }}
+        .type-missing_in_target {{ background: #fff3cd; color: #856404; }}
+        .type-value_check_failed {{ background: #cce5ff; color: #004085; }}
+        .record-body {{ padding: 15px; }}
+        .data-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; }}
+        .data-column {{ background: #fafafa; border-radius: 6px; padding: 12px; }}
+        .data-column h4 {{ color: #333; margin-bottom: 10px; padding-bottom: 5px; border-bottom: 1px solid #e0e0e0; font-size: 14px; }}
+        .data-column.raw-source h4 {{ color: #1976D2; }}
+        .data-column.expected h4 {{ color: #388E3C; }}
+        .data-column.target h4 {{ color: #F57C00; }}
+        .field-row {{ display: flex; padding: 6px 0; border-bottom: 1px solid #eee; }}
+        .field-row:last-child {{ border-bottom: none; }}
+        .field-name {{ flex: 0 0 100px; font-weight: 500; color: #666; font-size: 13px; }}
+        .field-value {{ flex: 1; color: #333; font-size: 13px; word-break: break-all; }}
+        .field-value.mismatch {{ background: #ffebee; padding: 2px 6px; border-radius: 3px; }}
+        .comparison-result {{ margin-top: 15px; padding: 10px; background: #fff3cd; border-radius: 6px; }}
+        .comparison-result h5 {{ color: #856404; margin-bottom: 8px; }}
+        .mismatch-item {{ padding: 5px 0; font-size: 13px; }}
+        .mismatch-item .expected {{ color: #388E3C; }}
+        .mismatch-item .actual {{ color: #D32F2F; }}
+        .no-records {{ text-align: center; color: #999; padding: 40px; }}
+        .toggle-icon {{ transition: transform 0.3s; }}
+        .toggle-icon.open {{ transform: rotate(180deg); }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Debug Report - 数据比对详细报告</h1>
+        <p style="color: #666; margin-bottom: 20px;">生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+
+        {self._generate_summary()}
+
+        {self._generate_table_sections()}
+    </div>
+
+    <script>
+        function toggleTable(header) {{
+            const content = header.nextElementSibling;
+            const icon = header.querySelector('.toggle-icon');
+            content.classList.toggle('active');
+            icon.classList.toggle('open');
+        }}
+
+        function filterRecords(tableId, type) {{
+            const container = document.getElementById(tableId);
+            const records = container.querySelectorAll('.record');
+            const buttons = container.querySelectorAll('.filter-btn');
+
+            buttons.forEach(btn => btn.classList.remove('active'));
+            event.target.classList.add('active');
+
+            records.forEach(record => {{
+                if (type === 'all' || record.dataset.type === type) {{
+                    record.style.display = 'block';
+                }} else {{
+                    record.style.display = 'none';
+                }}
+            }});
+        }}
+
+        function searchRecords(tableId, searchTerm) {{
+            const container = document.getElementById(tableId);
+            const records = container.querySelectorAll('.record');
+            const term = searchTerm.toLowerCase();
+
+            records.forEach(record => {{
+                const text = record.textContent.toLowerCase();
+                record.style.display = text.includes(term) ? 'block' : 'none';
+            }});
+        }}
+    </script>
+</body>
+</html>'''
+
+    def _generate_summary(self) -> str:
+        """生成摘要部分"""
+        total_records = sum(len(t['records']) for t in self._tables.values())
+        total_matched = sum(t['stats'].get('matched_rows', 0) for t in self._tables.values())
+        total_mismatched = sum(t['stats'].get('mismatched_rows', 0) for t in self._tables.values())
+        total_missing_source = sum(t['stats'].get('missing_in_source', 0) for t in self._tables.values())
+        total_missing_target = sum(t['stats'].get('missing_in_target', 0) for t in self._tables.values())
+
+        return f'''
+        <div class="summary">
+            <h2>总览</h2>
+            <div class="summary-grid">
+                <div class="summary-item">
+                    <div class="value">{len(self._tables)}</div>
+                    <div class="label">校验表数</div>
+                </div>
+                <div class="summary-item">
+                    <div class="value">{total_records}</div>
+                    <div class="label">Debug 记录数</div>
+                </div>
+                <div class="summary-item">
+                    <div class="value" style="color: #4CAF50;">{total_matched}</div>
+                    <div class="label">完全匹配</div>
+                </div>
+                <div class="summary-item">
+                    <div class="value" style="color: #f44336;">{total_mismatched}</div>
+                    <div class="label">字段不匹配</div>
+                </div>
+                <div class="summary-item">
+                    <div class="value" style="color: #ff9800;">{total_missing_target}</div>
+                    <div class="label">目标表缺失</div>
+                </div>
+                <div class="summary-item">
+                    <div class="value" style="color: #ff9800;">{total_missing_source}</div>
+                    <div class="label">源表缺失</div>
+                </div>
+            </div>
+        </div>'''
+
+    def _generate_table_sections(self) -> str:
+        """生成各表的详细部分"""
+        if not self._tables:
+            return '<div class="no-records">暂无 Debug 记录</div>'
+
+        sections = []
+        for idx, (table_name, data) in enumerate(self._tables.items()):
+            table_id = f"table-{idx}"
+            records = data['records']
+            stats = data['stats']
+
+            # 统计徽章
+            stat_badges = []
+            if stats.get('matched_rows', 0) > 0:
+                stat_badges.append(f'<span class="stat-matched">匹配: {stats["matched_rows"]}</span>')
+            if stats.get('mismatched_rows', 0) > 0:
+                stat_badges.append(f'<span class="stat-mismatched">不匹配: {stats["mismatched_rows"]}</span>')
+            if stats.get('missing_in_target', 0) > 0:
+                stat_badges.append(f'<span class="stat-missing">目标缺失: {stats["missing_in_target"]}</span>')
+            if stats.get('missing_in_source', 0) > 0:
+                stat_badges.append(f'<span class="stat-missing">源缺失: {stats["missing_in_source"]}</span>')
+
+            section = f'''
+        <div class="table-section">
+            <div class="table-header" onclick="toggleTable(this)">
+                <h3>{table_name}</h3>
+                <div>
+                    <span class="table-stats">{' '.join(stat_badges)}</span>
+                    <span class="toggle-icon">▼</span>
+                </div>
+            </div>
+            <div class="table-content">
+                <div class="filter-bar">
+                    <button class="filter-btn active" onclick="filterRecords('{table_id}', 'all')">全部</button>
+                    <button class="filter-btn" onclick="filterRecords('{table_id}', 'mismatched')">不匹配</button>
+                    <button class="filter-btn" onclick="filterRecords('{table_id}', 'missing_in_target')">目标缺失</button>
+                    <button class="filter-btn" onclick="filterRecords('{table_id}', 'missing_in_source')">源缺失</button>
+                    <button class="filter-btn" onclick="filterRecords('{table_id}', 'value_check_failed')">取值失败</button>
+                    <input type="text" class="search-box" placeholder="搜索..." oninput="searchRecords('{table_id}', this.value)">
+                </div>
+                <div id="{table_id}">
+                    {self._generate_records(records)}
+                </div>
+            </div>
+        </div>'''
+            sections.append(section)
+
+        return '\n'.join(sections)
+
+    def _generate_records(self, records: List[Dict[str, Any]]) -> str:
+        """生成记录列表"""
+        if not records:
+            return '<div class="no-records">暂无记录</div>'
+
+        html_records = []
+        for record in records:
+            record_type = record.get('match_type', 'unknown')
+            pk = record.get('primary_key', {})
+            pk_str = ', '.join(f'{k}={v}' for k, v in pk.items()) if isinstance(pk, dict) else str(pk)
+
+            # 生成三列数据
+            raw_source_html = self._generate_data_column('原始数据', record.get('raw_source', {}), 'raw-source')
+            expected_html = self._generate_data_column('期望值', record.get('expected_values', {}), 'expected')
+            target_html = self._generate_data_column('目标值', record.get('target_values', {}), 'target')
+
+            # 比对结果
+            comparison_html = ''
+            comparison_result = record.get('comparison_result', {})
+            if comparison_result:
+                mismatch_items = []
+                for field, result in comparison_result.items():
+                    if not result.get('match', True):
+                        mismatch_items.append(f'''
+                        <div class="mismatch-item">
+                            <strong>{field}</strong>:
+                            <span class="expected">期望: {self._format_value(result.get('expected'))}</span> |
+                            <span class="actual">实际: {self._format_value(result.get('actual'))}</span>
+                        </div>''')
+                if mismatch_items:
+                    comparison_html = f'''
+                <div class="comparison-result">
+                    <h5>字段差异</h5>
+                    {''.join(mismatch_items)}
+                </div>'''
+
+            # 取值范围校验失败
+            value_failures = record.get('value_check_failures', [])
+            if value_failures:
+                failure_items = []
+                for failure in value_failures:
+                    reasons = ', '.join(failure.get('reasons', []))
+                    failure_items.append(f'''
+                    <div class="mismatch-item">
+                        <strong>{failure.get('field')}</strong>:
+                        值: {self._format_value(failure.get('value'))} - {reasons}
+                    </div>''')
+                if failure_items:
+                    comparison_html += f'''
+                <div class="comparison-result" style="background: #cce5ff;">
+                    <h5 style="color: #004085;">取值范围校验失败</h5>
+                    {''.join(failure_items)}
+                </div>'''
+
+            record_html = f'''
+            <div class="record" data-type="{record_type}">
+                <div class="record-header">
+                    <span>主键: {pk_str}</span>
+                    <span class="record-type type-{record_type}">{self._get_type_label(record_type)}</span>
+                </div>
+                <div class="record-body">
+                    <div class="data-grid">
+                        {raw_source_html}
+                        {expected_html}
+                        {target_html}
+                    </div>
+                    {comparison_html}
+                </div>
+            </div>'''
+            html_records.append(record_html)
+
+        return '\n'.join(html_records)
+
+    def _generate_data_column(self, title: str, data: Dict[str, Any], css_class: str) -> str:
+        """生成数据列"""
+        rows = []
+        for field, value in data.items():
+            formatted_value = self._format_value(value)
+            rows.append(f'''
+                    <div class="field-row">
+                        <span class="field-name">{field}</span>
+                        <span class="field-value">{formatted_value}</span>
+                    </div>''')
+
+        return f'''
+                    <div class="data-column {css_class}">
+                        <h4>{title}</h4>
+                        {''.join(rows) if rows else '<div style="color: #999; font-size: 13px;">暂无数据</div>'}
+                    </div>'''
+
+    def _format_value(self, value: Any) -> str:
+        """格式化值"""
+        if value is None:
+            return '<span style="color: #999;">NULL</span>'
+        return _fmt_value(value)[:200]
+
+    def _get_type_label(self, record_type: str) -> str:
+        """获取类型标签"""
+        labels = {
+            'matched': '完全匹配',
+            'mismatched': '字段不匹配',
+            'missing_in_source': '源表缺失',
+            'missing_in_target': '目标表缺失',
+            'value_check_failed': '取值失败'
+        }
+        return labels.get(record_type, record_type)
+
+
+class DebugExporter:
+    """主 Debug 导出器 - 协调 JSONL 和 HTML 输出"""
+
+    def __init__(self, config: DebugConfig):
+        self.config = config
+        self._jsonl_writer: Optional[JsonlWriter] = None
+        self._html_generator: Optional[HtmlReportGenerator] = None
+        self._current_table: str = ""
+        self._current_records: List[Dict[str, Any]] = []
+        self._record_counter: int = 0
+        self._table_counter: int = 0
+
+    def start(self):
+        """初始化导出器"""
+        if not self.config.enabled:
+            return
+
+        # 创建输出目录
+        Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
+
+        # 初始化 HTML 生成器
+        if 'html' in self.config.formats:
+            timestamp = datetime.now().strftime('%Y%m%d')
+            html_path = Path(self.config.output_dir) / f"debug_report_{timestamp}.html"
+            self._html_generator = HtmlReportGenerator(str(html_path))
+
+        logger.info(f"Debug 导出器已启动, 输出目录: {self.config.output_dir}")
+
+    def start_table(self, table_name: str, mapping: 'TableMapping'):
+        """开始处理表"""
+        if not self.config.enabled:
+            return
+
+        self._current_table = table_name
+        self._current_records = []
+        self._table_counter += 1
+
+        # 创建表的 JSONL 写入器
+        if 'jsonl' in self.config.formats:
+            # 清理表名用于目录名
+            safe_name = table_name.replace(' -> ', '_to_').replace(' ', '_').replace('(', '').replace(')', '')
+            table_dir = Path(self.config.output_dir) / safe_name
+            jsonl_path = table_dir / "records.jsonl"
+            self._jsonl_writer = JsonlWriter(str(jsonl_path), self.config.buffer_size)
+            self._jsonl_writer.open()
+
+        logger.debug(f"开始 Debug 记录表: {table_name}")
+
+    def export_record(self, row: Any, mapping: 'TableMapping', field_alias_map: Dict[str, str],
+                     source_columns: List[str], value_check_fields: List['FieldMapping'] = None):
+        """
+        导出单条记录
+
+        Args:
+            row: Spark Row 对象
+            mapping: 表映射配置
+            field_alias_map: 字段别名映射
+            source_columns: 原始源表列名列表
+            value_check_fields: 需要取值范围校验的字段列表
+        """
+        if not self.config.enabled:
+            return
+
+        # 检查记录数限制
+        if self.config.max_records > 0 and self._record_counter >= self.config.max_records:
+            return
+
+        # 获取 Row 的字段列表 (Spark 4.x 兼容)
+        row_fields = row.__fields__ if hasattr(row, '__fields__') else []
+
+        # 获取匹配类型
+        match_type = self._get_row_value(row, '_match_type', row_fields)
+        if match_type is None:
+            return
+
+        # 确定有效的匹配类型：DataFrame 中字段不一致的行 _match_type 仍为 "matched"，
+        # 需结合 _all_fields_match 推导出真正的 "mismatched"
+        all_fields_match = self._get_row_value(row, '_all_fields_match', row_fields, default=True)
+        effective_match_type = 'mismatched' if (match_type == 'matched' and not all_fields_match) else match_type
+
+        # 检查是否需要记录该类型
+        if not self._should_record_type(effective_match_type):
+            return
+
+        # 生成记录 ID
+        self._record_counter += 1
+        record_id = f"{self._table_counter:03d}_{self._record_counter:06d}"
+
+        # 获取主键
+        primary_key = self._extract_primary_key(row, mapping, row_fields, match_type)
+
+        # 提取原始源数据
+        raw_source = {}
+        if self.config.include_raw_source and match_type != 'missing_in_source':
+            raw_source = self._extract_raw_source(row, source_columns, row_fields)
+            logger.debug(f"extracted raw_source: {raw_source}")
+
+        # 提取期望值
+        expected_values = {}
+        if self.config.include_expected and match_type not in ('missing_in_source', 'missing_in_target'):
+            expected_values = self._extract_expected_values(row, mapping, row_fields)
+            logger.debug(f"extracted expected_values: {expected_values}")
+
+        # 提取目标值
+        target_values = {}
+        if self.config.include_target and match_type != 'missing_in_target':
+            target_values = self._extract_target_values(row, mapping, row_fields)
+            logger.debug(f"extracted target_values: {target_values}")
+
+        # 提取比对结果
+        comparison_result = {}
+        if effective_match_type == 'mismatched':
+            comparison_result = self._extract_comparison_result(row, mapping, row_fields)
+
+        # 提取取值范围校验失败
+        value_check_failures = []
+        if value_check_fields and match_type != 'missing_in_target':
+            if not self._get_row_value(row, '_value_check_passed', row_fields, default=True):
+                value_check_failures = self._extract_value_check_failures(row, value_check_fields, row_fields)
+
+        # 创建记录
+        record = DebugRecord(
+            record_id=record_id,
+            primary_key=primary_key,
+            match_type=effective_match_type,
+            raw_source=raw_source,
+            expected_values=expected_values,
+            target_values=target_values,
+            comparison_result=comparison_result,
+            value_check_failures=value_check_failures
+        )
+
+        # 写入 JSONL
+        if self._jsonl_writer:
+            self._jsonl_writer.write_record(record.to_dict())
+
+        # 缓存到 HTML 记录 (限制数量避免内存问题)
+        if self._html_generator and len(self._current_records) < 1000:
+            self._current_records.append(record.to_dict())
+
+    def end_table(self, stats: Dict[str, int]):
+        """结束表处理"""
+        if not self.config.enabled:
+            return
+
+        # 关闭 JSONL 写入器
+        if self._jsonl_writer:
+            self._jsonl_writer.close()
+            self._jsonl_writer = None
+
+            # 写入 summary.json
+            safe_name = self._current_table.replace(' -> ', '_to_').replace(' ', '_').replace('(', '').replace(')', '')
+            summary_path = Path(self.config.output_dir) / safe_name / "summary.json"
+            with open(summary_path, 'w', encoding='utf-8') as f:
+                json.dump(stats, f, ensure_ascii=False, indent=2)
+
+        # 添加到 HTML 生成器
+        if self._html_generator:
+            self._html_generator.add_table_records(self._current_table, self._current_records, stats)
+
+        logger.debug(f"完成 Debug 记录表: {self._current_table}, 记录数: {len(self._current_records)}")
+        self._current_records = []
+
+    def close(self):
+        """关闭导出器"""
+        if not self.config.enabled:
+            return
+
+        # 生成 HTML 报告
+        if self._html_generator:
+            self._html_generator.generate()
+
+        logger.info(f"Debug 导出完成, 共 {self._record_counter} 条记录")
+
+    def _should_record_type(self, match_type: str) -> bool:
+        """检查是否应该记录该类型"""
+        type_mapping = {
+            'matched': self.config.include_matched,
+            'mismatched': self.config.include_mismatched,
+            'missing_in_source': self.config.include_missing,
+            'missing_in_target': self.config.include_missing,
+            'value_check_failed': self.config.include_value_check_failed
+        }
+        return type_mapping.get(match_type, False)
+
+    def _get_row_value(self, row: Any, field: str, row_fields: List[str], default: Any = None) -> Any:
+        """安全获取 Row 字段值 (Spark 4.x 兼容)"""
+        # 尝试带表别名
+        if f"s.{field}" in row_fields:
+            return row[f"s.{field}"]
+        if f"t.{field}" in row_fields:
+            return row[f"t.{field}"]
+        if field in row_fields:
+            return row[field]
+        return default
+
+    def _extract_primary_key(self, row: Any, mapping: 'TableMapping', row_fields: List[str], match_type: str) -> Dict[str, Any]:
+        """提取主键"""
+        pk_fields = [fm.target_field for fm in mapping.field_mappings if fm.is_primary_key]
+        if not pk_fields:
+            pk_fields = [fm.target_field for fm in mapping.field_mappings]
+
+        pk_dict = {}
+        # 优先尝试带 s. 前缀
+        source_pk = self._get_row_value(row, 's._source_pk', row_fields)
+        if source_pk is None:
+            source_pk = self._get_row_value(row, '_source_pk', row_fields)
+        # 优先尝试带 t. 前缀
+        target_pk = self._get_row_value(row, 't._target_pk', row_fields)
+        if target_pk is None:
+            target_pk = self._get_row_value(row, '_target_pk', row_fields)
+
+        if match_type == 'missing_in_target' and source_pk is not None:
+            # 从 source_pk 结构中提取
+            if hasattr(source_pk, '__fields__'):
+                for f in source_pk.__fields__:
+                    pk_dict[f] = _fmt_value(source_pk[f])
+            elif isinstance(source_pk, dict):
+                pk_dict = {k: _fmt_value(v) for k, v in source_pk.items()}
+            else:
+                pk_dict['pk'] = _fmt_value(source_pk)
+        elif match_type == 'missing_in_source' and target_pk is not None:
+            if hasattr(target_pk, '__fields__'):
+                for f in target_pk.__fields__:
+                    pk_dict[f] = _fmt_value(target_pk[f])
+            elif isinstance(target_pk, dict):
+                pk_dict = {k: _fmt_value(v) for k, v in target_pk.items()}
+            else:
+                pk_dict['pk'] = _fmt_value(target_pk)
+        else:
+            # 从各字段提取，以字段存在性判断
+            for pk_field in pk_fields:
+                s_exp_col = f"s._expected_{pk_field}"
+                exp_col = f"_expected_{pk_field}"
+                if s_exp_col in row_fields:
+                    pk_dict[pk_field] = _fmt_value(row[s_exp_col])
+                elif exp_col in row_fields:
+                    pk_dict[pk_field] = _fmt_value(row[exp_col])
+                elif pk_field in row_fields:
+                    pk_dict[pk_field] = _fmt_value(row[pk_field])
+
+        return pk_dict if pk_dict else {'pk': 'unknown'}
+
+    def _extract_raw_source(self, row: Any, source_columns: List[str], row_fields: List[str]) -> Dict[str, Any]:
+        """提取原始源数据"""
+        raw_source = {}
+        for col_name in source_columns:
+            # 尝试不同的列名格式 (join 后列名带 s. 前缀)，以字段存在性判断而非值是否为 None
+            col_with_prefix = f"s.{col_name}"
+            if col_with_prefix in row_fields:
+                raw_source[col_name] = _fmt_value(row[col_with_prefix])
+            elif col_name in row_fields:
+                raw_source[col_name] = _fmt_value(row[col_name])
+
+        return raw_source
+
+    def _extract_expected_values(self, row: Any, mapping: 'TableMapping', row_fields: List[str]) -> Dict[str, Any]:
+        """提取期望值"""
+        expected = {}
+        for fm in mapping.field_mappings:
+            expected_col = f"_expected_{fm.target_field}"
+            s_expected_col = f"s.{expected_col}"
+            # 以字段存在性判断，优先带 s. 前缀（join 后列名格式）
+            if s_expected_col in row_fields:
+                expected[fm.target_field] = _fmt_value(row[s_expected_col])
+            elif expected_col in row_fields:
+                expected[fm.target_field] = _fmt_value(row[expected_col])
+        return expected
+
+    def _extract_target_values(self, row: Any, mapping: 'TableMapping', row_fields: List[str]) -> Dict[str, Any]:
+        """提取目标值"""
+        target = {}
+        for fm in mapping.field_mappings:
+            # 以字段存在性判断，优先带 t. 前缀（join 后列名格式）
+            t_col = f"t.{fm.target_field}"
+            if t_col in row_fields:
+                target[fm.target_field] = _fmt_value(row[t_col])
+            elif fm.target_field in row_fields:
+                target[fm.target_field] = _fmt_value(row[fm.target_field])
+        return target
+
+    def _extract_comparison_result(self, row: Any, mapping: 'TableMapping', row_fields: List[str]) -> Dict[str, Any]:
+        """提取比对结果"""
+        result = {}
+        for fm in mapping.field_mappings:
+            cmp_col = f"_cmp_{fm.target_field}"
+            is_match = self._get_row_value(row, cmp_col, row_fields)
+            if is_match is False:  # 明确不匹配
+                # 以字段存在性判断，避免将 NULL 值误判为字段缺失而继续 fallback
+                s_exp_col = f"s._expected_{fm.target_field}"
+                exp_col = f"_expected_{fm.target_field}"
+                if s_exp_col in row_fields:
+                    expected_val = row[s_exp_col]
+                elif exp_col in row_fields:
+                    expected_val = row[exp_col]
+                else:
+                    expected_val = None
+
+                t_col = f"t.{fm.target_field}"
+                if t_col in row_fields:
+                    actual_val = row[t_col]
+                elif fm.target_field in row_fields:
+                    actual_val = row[fm.target_field]
+                else:
+                    actual_val = None
+
+                result[fm.target_field] = {
+                    'match': False,
+                    'expected': _fmt_value(expected_val),
+                    'actual': _fmt_value(actual_val)
+                }
+        return result
+
+    def _extract_value_check_failures(self, row: Any, value_check_fields: List['FieldMapping'], row_fields: List[str]) -> List[Dict[str, Any]]:
+        """提取取值范围校验失败"""
+        failures = []
+        for fm in value_check_fields:
+            check_col = f"_value_check_{fm.target_field}"
+            is_passed = self._get_row_value(row, check_col, row_fields)
+            if is_passed is False:
+                # 以字段存在性判断获取字段值，避免 NULL 值触发 fallback
+                t_col = f"t.{fm.target_field}"
+                if t_col in row_fields:
+                    field_value = row[t_col]
+                elif fm.target_field in row_fields:
+                    field_value = row[fm.target_field]
+                else:
+                    field_value = None
+
+                # 构建失败原因
+                reasons = []
+                if field_value is None:
+                    if not fm.nullable:
+                        reasons.append("字段不允许为空")
+                else:
+                    if fm.min_value is not None and field_value < fm.min_value:
+                        reasons.append(f"小于最小值 {fm.min_value}")
+                    if fm.max_value is not None and field_value > fm.max_value:
+                        reasons.append(f"大于最大值 {fm.max_value}")
+                    if fm.allowed_values and field_value not in fm.allowed_values:
+                        reasons.append(f"不在允许值列表中")
+                    if fm.pattern:
+                        reasons.append(f"不匹配正则 {fm.pattern}")
+                    if fm.value_check_expr:
+                        reasons.append(f"不满足条件 {fm.value_check_expr}")
+
+                failures.append({
+                    'field': fm.target_field,
+                    'value': _fmt_value(field_value),
+                    'reasons': reasons
+                })
+        return failures
+
+
 class SparkDataValidator:
     """Spark 数据校验器"""
 
@@ -291,14 +926,10 @@ class SparkDataValidator:
         self._source_props = None
         self._target_props = None
 
-        # 初始化 Debug 日志记录器
+        # 初始化 Debug 导出器
         debug_config = mapping_config.get('global_settings', {}).get('debug', {})
-        self.debug_logger = DebugLogger(
-            enabled=debug_config.get('enabled', False),
-            output_file=debug_config.get('output_file', './debug/comparison_debug.md'),
-            max_records=debug_config.get('max_records', 1000),
-            include_matched=debug_config.get('include_matched', False)
-        )
+        self.debug_config = DebugConfig.from_dict(debug_config)
+        self.debug_exporter = DebugExporter(self.debug_config)
     
     def _create_spark_session(self) -> SparkSession:
         """创建 Spark Session"""
@@ -939,19 +1570,33 @@ class SparkDataValidator:
         )
         start_time = datetime.now()
 
-        # 开始 debug 日志记录
-        if self.debug_logger.enabled:
-            self.debug_logger.start_table(source_desc, mapping.target_table)
+        # 开始 debug 导出
+        if self.debug_config.enabled:
+            self.debug_exporter.start_table(result.table_name, mapping)
+
+        # 保存源表列名 (用于 debug 导出)
+        source_columns = []
+        raw_source_columns = []  # 原始源表列名 (用于提取 raw_source)
 
         try:
             logger.info(f"读取源表: {source_desc}")
             source_df, field_alias_map = self.read_source_table(mapping)
+            raw_source_columns = [c for c in source_df.columns if not c.startswith('_')]  # 保存原始列名
 
             logger.info(f"读取目标表: {mapping.target_table}")
             target_df = self.read_target_table(mapping)
 
             # 构建源 DataFrame（包含期望值）
             source_with_expected = self.build_source_df(source_df, mapping, field_alias_map)
+
+            # 保存包含期望值的列名 (用于 debug 导出)
+            source_columns = source_with_expected.columns
+
+            # 构建源 DataFrame（包含期望值）
+            source_with_expected = self.build_source_df(source_df, mapping, field_alias_map)
+
+            # 保存包含期望值的列名 (用于 debug 导出)
+            source_columns = source_with_expected.columns
 
             # 获取主键字段
             pk_fields = [fm.target_field for fm in mapping.field_mappings if fm.is_primary_key]
@@ -1116,7 +1761,57 @@ class SparkDataValidator:
             logger.info(f"匹配: {result.matched_rows}, 不匹配: {result.mismatched_rows}, "
                        f"源缺失: {result.missing_in_source}, 目标缺失: {result.missing_in_target}")
 
-            # 收集错误样本 (限制数量) + Debug 日志记录
+            # ========== Debug 导出: 批量导出记录 ==========
+            if self.debug_config.enabled:
+                # 确定需要导出的记录类型
+                debug_filter = None
+                if self.debug_config.include_matched and result.matched_rows > 0:
+                    if debug_filter is None:
+                        debug_filter = (col("_match_type") == "matched") & col("_all_fields_match")
+                    else:
+                        debug_filter = debug_filter | ((col("_match_type") == "matched") & col("_all_fields_match"))
+
+                if self.debug_config.include_mismatched and result.mismatched_rows > 0:
+                    mismatched_cond = (col("_match_type") == "matched") & ~col("_all_fields_match")
+                    if debug_filter is None:
+                        debug_filter = mismatched_cond
+                    else:
+                        debug_filter = debug_filter | mismatched_cond
+
+                if self.debug_config.include_missing and result.missing_in_target > 0:
+                    if debug_filter is None:
+                        debug_filter = col("_match_type") == "missing_in_target"
+                    else:
+                        debug_filter = debug_filter | (col("_match_type") == "missing_in_target")
+
+                if self.debug_config.include_missing and result.missing_in_source > 0:
+                    if debug_filter is None:
+                        debug_filter = col("_match_type") == "missing_in_source"
+                    else:
+                        debug_filter = debug_filter | (col("_match_type") == "missing_in_source")
+
+                if self.debug_config.include_value_check_failed and result.value_check_failed > 0:
+                    value_check_cond = (col("_match_type") != "missing_in_target") & ~col("_value_check_passed")
+                    if debug_filter is None:
+                        debug_filter = value_check_cond
+                    else:
+                        debug_filter = debug_filter | value_check_cond
+
+                # 导出记录
+                if debug_filter is not None:
+                    debug_records = classified_df.filter(debug_filter).limit(self.debug_config.max_records).collect()
+                    logger.debug(f"Debug 导出: 找到 {len(debug_records)} 条记录")
+                    if debug_records:
+                        # 打印第一条记录的字段名，用于调试
+                        first_row_fields = debug_records[0].__fields__ if hasattr(debug_records[0], '__fields__') else []
+                        logger.debug(f"Row 字段名示例: {first_row_fields[:10]}...")
+                        logger.debug(f"raw_source_columns: {raw_source_columns}")
+                    for row in debug_records:
+                        self.debug_exporter.export_record(
+                            row, mapping, field_alias_map, raw_source_columns, value_check_fields
+                        )
+
+            # 收集错误样本 (限制数量)
             if result.missing_in_target > 0:
                 sample_errors = classified_df.filter(col("_match_type") == "missing_in_target").limit(10).collect()
                 for row in sample_errors:
@@ -1124,8 +1819,6 @@ class SparkDataValidator:
                         'type': 'missing_in_target',
                         'key': row['_source_pk']
                     })
-                    # Debug 日志
-                    self.debug_logger.log_comparison(row['_source_pk'], 'missing_in_target')
 
             if result.missing_in_source > 0:
                 sample_errors = classified_df.filter(col("_match_type") == "missing_in_source").limit(10).collect()
@@ -1134,24 +1827,37 @@ class SparkDataValidator:
                         'type': 'missing_in_source',
                         'key': row['_target_pk']
                     })
-                    # Debug 日志
-                    self.debug_logger.log_comparison(row['_target_pk'], 'missing_in_source')
 
             if result.mismatched_rows > 0:
+                # 显式 select 并重命名，消除 join 后同名列的歧义
+                # 只对有 _expected_* 列的字段（即有 source_field 或 transform 的）加入 select，
+                # skip 类字段且无 source_field/transform 时 _expected_* 不存在，会引发 AnalysisException
+                comparable_fields = [fm for fm in mapping.field_mappings
+                                     if fm.source_field or fm.transform]
+                mismatch_select = [col("_source_pk")]
+                for fm in mapping.field_mappings:
+                    mismatch_select.append(col(f"_cmp_{fm.target_field}"))
+                for fm in comparable_fields:
+                    mismatch_select.append(
+                        col(f"s._expected_{fm.target_field}").alias(f"_exp_{fm.target_field}")
+                    )
+                    mismatch_select.append(
+                        col(f"t.{fm.target_field}").alias(f"_act_{fm.target_field}")
+                    )
+
                 sample_errors = classified_df.filter(
                     (col("_match_type") == "matched") & ~col("_all_fields_match")
-                ).limit(10).collect()
+                ).select(*mismatch_select).limit(10).collect()
 
+                comparable_set = {fm.target_field for fm in comparable_fields}
                 for row in sample_errors:
                     mismatched_fields = []
                     for fm in mapping.field_mappings:
-                        if not row[f"_cmp_{fm.target_field}"]:
-                            expected_val = row[f"_expected_{fm.target_field}"]
-                            actual_val = row[fm.target_field]
+                        if row[f"_cmp_{fm.target_field}"] is False and fm.target_field in comparable_set:
                             mismatched_fields.append({
                                 'field': fm.target_field,
-                                'expected': str(expected_val) if expected_val is not None else 'NULL',
-                                'actual': str(actual_val) if actual_val is not None else 'NULL'
+                                'expected': _fmt_value(row[f"_exp_{fm.target_field}"]),
+                                'actual': _fmt_value(row[f"_act_{fm.target_field}"])
                             })
 
                     result.errors.append({
@@ -1159,9 +1865,6 @@ class SparkDataValidator:
                         'key': row['_source_pk'],
                         'mismatched_fields': mismatched_fields
                     })
-                    # Debug 日志
-                    self.debug_logger.log_comparison(row['_source_pk'], 'mismatched',
-                                                    {'mismatched_fields': mismatched_fields})
 
             # 收集取值范围校验失败样本
             if result.value_check_failed > 0:
@@ -1204,7 +1907,7 @@ class SparkDataValidator:
 
                             failed_checks.append({
                                 'field': fm.target_field,
-                                'value': str(field_value) if field_value is not None else 'NULL',
+                                'value': _fmt_value(field_value),
                                 'reasons': check_reasons
                             })
 
@@ -1220,9 +1923,6 @@ class SparkDataValidator:
                         'key': key_value,
                         'failed_checks': failed_checks
                     })
-                    # Debug 日志
-                    self.debug_logger.log_comparison(key_value, 'value_check_failed',
-                                                    {'failed_checks': failed_checks})
 
             # 清理缓存
             source_with_expected.unpersist()
@@ -1231,9 +1931,9 @@ class SparkDataValidator:
             result.status = "completed"
             logger.info(f"完成表 {source_desc} 校验")
 
-            # 结束 debug 日志记录 - 写入统计和详情
-            if self.debug_logger.enabled:
-                self.debug_logger.end_table({
+            # 结束 debug 导出 - 写入统计和详情
+            if self.debug_config.enabled:
+                self.debug_exporter.end_table({
                     'total_rows': result.total_rows,
                     'matched_rows': result.matched_rows,
                     'mismatched_rows': result.mismatched_rows,
@@ -1255,8 +1955,8 @@ class SparkDataValidator:
     
     def run_validation(self) -> List[ValidationResult]:
         """运行全部校验"""
-        # 启动 debug 日志记录
-        self.debug_logger.start_log()
+        # 启动 debug 导出
+        self.debug_exporter.start()
 
         tables = self.config.get('tables', [])
 
@@ -1288,8 +1988,8 @@ class SparkDataValidator:
             result = self.validate_table(mapping)
             self.results.append(result)
 
-        # 关闭 debug 日志记录
-        self.debug_logger.close()
+        # 关闭 debug 导出
+        self.debug_exporter.close()
 
         return self.results
     

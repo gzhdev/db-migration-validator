@@ -312,28 +312,87 @@
         },
         "debug": {
           "type": "object",
-          "description": "Debug 模式配置",
+          "description": "Debug 模式配置（Spark版）",
           "properties": {
             "enabled": {
               "type": "boolean",
               "default": false,
               "description": "是否启用 debug 模式"
             },
-            "output_file": {
+            "output_dir": {
               "type": "string",
-              "default": "./debug/comparison_debug.md",
-              "description": "debug 日志文件路径"
+              "default": "./debug",
+              "description": "debug 输出目录"
+            },
+            "formats": {
+              "type": "array",
+              "items": { "type": "string", "enum": ["jsonl", "html"] },
+              "default": ["jsonl", "html"],
+              "description": "输出格式：jsonl（数据导出）、html（交互式报告）"
             },
             "max_records": {
               "type": "integer",
-              "default": 1000,
+              "default": 10000,
               "minimum": 0,
-              "description": "每个表最多记录的比对条数，0 表示不限制"
+              "description": "最多记录的比对条数，0 表示不限制"
             },
-            "include_matched": {
-              "type": "boolean",
-              "default": false,
-              "description": "是否包含完全匹配的记录"
+            "buffer_size": {
+              "type": "integer",
+              "default": 1000,
+              "minimum": 100,
+              "description": "JSONL 写入缓冲区大小"
+            },
+            "record_types": {
+              "type": "object",
+              "description": "记录类型过滤配置",
+              "properties": {
+                "matched": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "是否记录完全匹配的记录"
+                },
+                "mismatched": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "是否记录字段不匹配的记录"
+                },
+                "missing_in_source": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "是否记录源表缺失的记录"
+                },
+                "missing_in_target": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "是否记录目标表缺失的记录"
+                },
+                "value_check_failed": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "是否记录取值范围校验失败的记录"
+                }
+              }
+            },
+            "data_content": {
+              "type": "object",
+              "description": "数据内容配置",
+              "properties": {
+                "include_raw_source": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "是否包含原始源数据"
+                },
+                "include_expected": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "是否包含转换后的期望值"
+                },
+                "include_target": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "是否包含目标表实际值"
+                }
+              }
             }
           }
         }
