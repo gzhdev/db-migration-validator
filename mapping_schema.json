@@ -309,6 +309,33 @@
           "items": { "type": "string", "enum": ["json", "csv", "html", "markdown"] },
           "default": ["json", "html"],
           "description": "报告输出格式"
+        },
+        "debug": {
+          "type": "object",
+          "description": "Debug 模式配置",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false,
+              "description": "是否启用 debug 模式"
+            },
+            "output_file": {
+              "type": "string",
+              "default": "./debug/comparison_debug.md",
+              "description": "debug 日志文件路径"
+            },
+            "max_records": {
+              "type": "integer",
+              "default": 1000,
+              "minimum": 0,
+              "description": "每个表最多记录的比对条数，0 表示不限制"
+            },
+            "include_matched": {
+              "type": "boolean",
+              "default": false,
+              "description": "是否包含完全匹配的记录"
+            }
+          }
         }
       }
     }

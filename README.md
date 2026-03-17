@@ -564,10 +564,88 @@ python-oracledb 支持两种模式：
     "parallel_workers": 4,
     "timeout_seconds": 3600,
     "output_dir": "./reports",
-    "report_format": ["json", "html", "markdown"]
+    "report_format": ["json", "html", "markdown"],
+    "debug": {
+      "enabled": true,
+      "output_file": "./debug/comparison_debug.md",
+      "max_records": 1000,
+      "include_matched": false
+    }
   }
 }
 ```
+
+### 9. Debug 模式
+
+启用 debug 模式可以记录详细的比对过程，便于排查数据不一致问题。
+
+```json
+{
+  "global_settings": {
+    "debug": {
+      "enabled": true,
+      "output_file": "./debug/comparison_debug.md",
+      "max_records": 1000,
+      "include_matched": false
+    }
+  }
+}
+```
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `enabled` | bool | false | 是否启用 debug 模式 |
+| `output_file` | string | `./debug/comparison_debug.md` | debug 日志文件路径 |
+| `max_records` | int | 1000 | 每个表最多记录的比对条数，**0 表示不限制** |
+| `include_matched` | bool | false | 是否包含完全匹配的记录 |
+
+**Debug 日志输出示例**：
+
+```markdown
+# 数据比对 Debug 日志
+
+生成时间: 2026-03-16 17:30:00
+
+---
+
+## 表: users -> user_profile
+
+### 统计摘要
+- 总记录数: 9207
+- 完全匹配: 9200
+- 字段不匹配: 5
+- 源表缺失: 1
+- 目标表缺失: 1
+
+### 比对记录详情
+
+#### 字段不匹配记录 (5条)
+
+| 主键 | 字段 | 期望值 | 实际值 |
+|------|------|--------|--------|
+| {id: 123} | status | "active" | "inactive" |
+| {id: 456} | amount | 100.00 | 99.99 |
+
+#### 目标表缺失记录 (1条)
+
+| 主键 |
+|------|
+| {id: 789} |
+
+#### 源表缺失记录 (1条)
+
+| 主键 |
+|------|
+| {id: 999} |
+
+---
+```
+
+**注意事项**：
+- `max_records` 限制每个表记录的最大条数，**设为 0 表示不限制**（可能导致文件过大）
+- `include_matched: true` 会记录所有完全匹配的记录，数据量可能很大
+- debug 模式会影响性能，建议仅在排查问题时启用
+- debug 日志可能包含敏感数据，注意文件权限
 
 ---
 
@@ -646,7 +724,13 @@ python-oracledb 支持两种模式：
   "global_settings": {
     "parallel_workers": 4,
     "output_dir": "./validation_reports",
-    "report_format": ["json", "markdown"]
+    "report_format": ["json", "markdown"],
+    "debug": {
+      "enabled": false,
+      "output_file": "./debug/comparison_debug.md",
+      "max_records": 1000,
+      "include_matched": false
+    }
   }
 }
 ```

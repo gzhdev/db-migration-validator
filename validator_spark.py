@@ -27,6 +27,188 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class DebugLogger:
+    """Debug 日志记录器 - 记录详细的比对过程到 Markdown 文件"""
+
+    def __init__(self, enabled: bool = False, output_file: str = "./debug/comparison_debug.md",
+                 max_records: int = 1000, include_matched: bool = False):
+        self.enabled = enabled
+        self.output_file = output_file
+        self.max_records = max_records
+        self.include_matched = include_matched
+        self._file = None
+        self._current_table = None
+        self._record_count = 0
+        self._records = {
+            'matched': [],
+            'mismatched': [],
+            'missing_in_source': [],
+            'missing_in_target': [],
+            'value_check_failed': []
+        }
+
+    def start_log(self):
+        """开始记录 debug 日志"""
+        if not self.enabled:
+            return
+
+        # 创建输出目录
+        output_path = Path(self.output_file)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._file = open(self.output_file, 'w', encoding='utf-8')
+        self._file.write("# 数据比对 Debug 日志\n\n")
+        self._file.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        self._file.write("---\n\n")
+
+    def start_table(self, source_name: str, target_name: str):
+        """开始记录表的比对"""
+        if not self.enabled or not self._file:
+            return
+
+        self._current_table = f"{source_name} -> {target_name}"
+        self._record_count = 0
+        self._records = {
+            'matched': [],
+            'mismatched': [],
+            'missing_in_source': [],
+            'missing_in_target': [],
+            'value_check_failed': []
+        }
+
+    def log_comparison(self, pk: Any, match_type: str, details: Dict[str, Any] = None):
+        """
+        记录单条比对结果
+
+        Args:
+            pk: 主键值
+            match_type: 比对类型 (matched, mismatched, missing_in_source, missing_in_target, value_check_failed)
+            details: 详细信息
+        """
+        if not self.enabled or (self.max_records > 0 and self._record_count >= self.max_records):
+            return
+
+        # 只记录非匹配记录，除非配置了 include_matched
+        if match_type == 'matched' and not self.include_matched:
+            return
+
+        record = {
+            'pk': pk,
+            'details': details or {}
+        }
+
+        if match_type in self._records:
+            self._records[match_type].append(record)
+            self._record_count += 1
+
+    def end_table(self, stats: Dict[str, int]):
+        """结束表的比对，写入统计和详情"""
+        if not self.enabled or not self._file or not self._current_table:
+            return
+
+        self._file.write(f"## 表: {self._current_table}\n\n")
+
+        # 写入统计摘要
+        self._file.write("### 统计摘要\n\n")
+        self._file.write(f"- 总记录数: {stats.get('total_rows', 0)}\n")
+        self._file.write(f"- 完全匹配: {stats.get('matched_rows', 0)}\n")
+        self._file.write(f"- 字段不匹配: {stats.get('mismatched_rows', 0)}\n")
+        self._file.write(f"- 源表缺失: {stats.get('missing_in_source', 0)}\n")
+        self._file.write(f"- 目标表缺失: {stats.get('missing_in_target', 0)}\n")
+        if stats.get('value_check_failed', 0) > 0:
+            self._file.write(f"- 取值范围失败: {stats.get('value_check_failed', 0)}\n")
+        self._file.write("\n")
+
+        # 写入比对记录详情
+        self._file.write("### 比对记录详情\n\n")
+
+        # 字段不匹配记录
+        if self._records['mismatched']:
+            self._file.write(f"#### 字段不匹配记录 ({len(self._records['mismatched'])}条)\n\n")
+            self._file.write("| 主键 | 字段 | 期望值 | 实际值 |\n")
+            self._file.write("|------|------|--------|--------|\n")
+            for record in self._records['mismatched']:
+                pk_str = self._format_pk(record['pk'])
+                for field_err in record['details'].get('mismatched_fields', []):
+                    self._file.write(f"| {pk_str} | {field_err['field']} | "
+                                   f"{self._format_value(field_err['expected'])} | "
+                                   f"{self._format_value(field_err['actual'])} |\n")
+            self._file.write("\n")
+
+        # 目标表缺失记录
+        if self._records['missing_in_target']:
+            self._file.write(f"#### 目标表缺失记录 ({len(self._records['missing_in_target'])}条)\n\n")
+            self._file.write("| 主键 |\n")
+            self._file.write("|------|\n")
+            for record in self._records['missing_in_target']:
+                pk_str = self._format_pk(record['pk'])
+                self._file.write(f"| {pk_str} |\n")
+            self._file.write("\n")
+
+        # 源表缺失记录
+        if self._records['missing_in_source']:
+            self._file.write(f"#### 源表缺失记录 ({len(self._records['missing_in_source'])}条)\n\n")
+            self._file.write("| 主键 |\n")
+            self._file.write("|------|\n")
+            for record in self._records['missing_in_source']:
+                pk_str = self._format_pk(record['pk'])
+                self._file.write(f"| {pk_str} |\n")
+            self._file.write("\n")
+
+        # 取值范围校验失败记录
+        if self._records['value_check_failed']:
+            self._file.write(f"#### 取值范围校验失败记录 ({len(self._records['value_check_failed'])}条)\n\n")
+            self._file.write("| 主键 | 字段 | 值 | 失败原因 |\n")
+            self._file.write("|------|------|-----|----------|\n")
+            for record in self._records['value_check_failed']:
+                pk_str = self._format_pk(record['pk'])
+                for check_err in record['details'].get('failed_checks', []):
+                    reasons = ", ".join(check_err.get('reasons', []))
+                    self._file.write(f"| {pk_str} | {check_err['field']} | "
+                                   f"{self._format_value(check_err['value'])} | {reasons} |\n")
+            self._file.write("\n")
+
+        # 完全匹配记录（如果配置了 include_matched）
+        if self._records['matched']:
+            self._file.write(f"#### 完全匹配记录 ({len(self._records['matched'])}条)\n\n")
+            self._file.write("| 主键 |\n")
+            self._file.write("|------|\n")
+            for record in self._records['matched'][:20]:  # 最多显示20条
+                pk_str = self._format_pk(record['pk'])
+                self._file.write(f"| {pk_str} |\n")
+            if len(self._records['matched']) > 20:
+                self._file.write(f"\n*...共 {len(self._records['matched'])} 条记录*\n")
+            self._file.write("\n")
+
+        self._file.write("---\n\n")
+        self._file.flush()
+
+    def _format_pk(self, pk: Any) -> str:
+        """格式化主键值"""
+        if pk is None:
+            return "NULL"
+        pk_str = str(pk)
+        # 处理 Row 对象的显示
+        if pk_str.startswith('Row('):
+            # 简化 Row 显示
+            return pk_str.replace('Row(', '{').replace(')', '}').replace('=', ': ')
+        return pk_str
+
+    def _format_value(self, value: Any) -> str:
+        """格式化字段值"""
+        if value is None:
+            return "NULL"
+        return str(value).replace("|", "\\|").replace("\n", "\\n")[:100]  # 限制长度
+
+    def close(self):
+        """关闭日志文件"""
+        if self._file:
+            self._file.write(f"\n*日志生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n")
+            self._file.close()
+            self._file = None
+            logger.info(f"Debug 日志已保存: {self.output_file}")
+
+
 @dataclass
 class SourceTable:
     """多表 JOIN 中的源表配置"""
@@ -97,17 +279,26 @@ class ValidationResult:
 
 class SparkDataValidator:
     """Spark 数据校验器"""
-    
+
     def __init__(self, mapping_config: Dict[str, Any], spark: SparkSession = None):
         self.config = mapping_config
         self.spark = spark or self._create_spark_session()
         self.results: List[ValidationResult] = []
-        
+
         # JDBC 连接属性缓存
         self._source_jdbc_url = None
         self._target_jdbc_url = None
         self._source_props = None
         self._target_props = None
+
+        # 初始化 Debug 日志记录器
+        debug_config = mapping_config.get('global_settings', {}).get('debug', {})
+        self.debug_logger = DebugLogger(
+            enabled=debug_config.get('enabled', False),
+            output_file=debug_config.get('output_file', './debug/comparison_debug.md'),
+            max_records=debug_config.get('max_records', 1000),
+            include_matched=debug_config.get('include_matched', False)
+        )
     
     def _create_spark_session(self) -> SparkSession:
         """创建 Spark Session"""
@@ -748,6 +939,10 @@ class SparkDataValidator:
         )
         start_time = datetime.now()
 
+        # 开始 debug 日志记录
+        if self.debug_logger.enabled:
+            self.debug_logger.start_table(source_desc, mapping.target_table)
+
         try:
             logger.info(f"读取源表: {source_desc}")
             source_df, field_alias_map = self.read_source_table(mapping)
@@ -920,8 +1115,8 @@ class SparkDataValidator:
             
             logger.info(f"匹配: {result.matched_rows}, 不匹配: {result.mismatched_rows}, "
                        f"源缺失: {result.missing_in_source}, 目标缺失: {result.missing_in_target}")
-            
-            # 收集错误样本 (限制数量)
+
+            # 收集错误样本 (限制数量) + Debug 日志记录
             if result.missing_in_target > 0:
                 sample_errors = classified_df.filter(col("_match_type") == "missing_in_target").limit(10).collect()
                 for row in sample_errors:
@@ -929,7 +1124,9 @@ class SparkDataValidator:
                         'type': 'missing_in_target',
                         'key': row['_source_pk']
                     })
-            
+                    # Debug 日志
+                    self.debug_logger.log_comparison(row['_source_pk'], 'missing_in_target')
+
             if result.missing_in_source > 0:
                 sample_errors = classified_df.filter(col("_match_type") == "missing_in_source").limit(10).collect()
                 for row in sample_errors:
@@ -937,7 +1134,9 @@ class SparkDataValidator:
                         'type': 'missing_in_source',
                         'key': row['_target_pk']
                     })
-            
+                    # Debug 日志
+                    self.debug_logger.log_comparison(row['_target_pk'], 'missing_in_source')
+
             if result.mismatched_rows > 0:
                 sample_errors = classified_df.filter(
                     (col("_match_type") == "matched") & ~col("_all_fields_match")
@@ -960,6 +1159,9 @@ class SparkDataValidator:
                         'key': row['_source_pk'],
                         'mismatched_fields': mismatched_fields
                     })
+                    # Debug 日志
+                    self.debug_logger.log_comparison(row['_source_pk'], 'mismatched',
+                                                    {'mismatched_fields': mismatched_fields})
 
             # 收集取值范围校验失败样本
             if result.value_check_failed > 0:
@@ -1018,6 +1220,9 @@ class SparkDataValidator:
                         'key': key_value,
                         'failed_checks': failed_checks
                     })
+                    # Debug 日志
+                    self.debug_logger.log_comparison(key_value, 'value_check_failed',
+                                                    {'failed_checks': failed_checks})
 
             # 清理缓存
             source_with_expected.unpersist()
@@ -1025,6 +1230,17 @@ class SparkDataValidator:
 
             result.status = "completed"
             logger.info(f"完成表 {source_desc} 校验")
+
+            # 结束 debug 日志记录 - 写入统计和详情
+            if self.debug_logger.enabled:
+                self.debug_logger.end_table({
+                    'total_rows': result.total_rows,
+                    'matched_rows': result.matched_rows,
+                    'mismatched_rows': result.mismatched_rows,
+                    'missing_in_source': result.missing_in_source,
+                    'missing_in_target': result.missing_in_target,
+                    'value_check_failed': result.value_check_failed
+                })
 
         except Exception as e:
             logger.error(f"校验表 {source_desc} 时出错: {e}")
@@ -1039,6 +1255,9 @@ class SparkDataValidator:
     
     def run_validation(self) -> List[ValidationResult]:
         """运行全部校验"""
+        # 启动 debug 日志记录
+        self.debug_logger.start_log()
+
         tables = self.config.get('tables', [])
 
         for table_config in tables:
@@ -1068,6 +1287,9 @@ class SparkDataValidator:
 
             result = self.validate_table(mapping)
             self.results.append(result)
+
+        # 关闭 debug 日志记录
+        self.debug_logger.close()
 
         return self.results
     
