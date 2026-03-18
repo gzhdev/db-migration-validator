@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}首页 — Debug Viewer{% endblock %}
+
+{% block content %}
+<h1 class="page-title">Debug 日志查看器</h1>
+
+<section class="card import-card">
+    <h2>导入 Debug 目录</h2>
+    {% if error %}
+    <p class="alert alert-error">{{ error }}</p>
+    {% endif %}
+    <form method="POST" action="{{ url_for('import_run') }}" class="import-form">
+        <input type="text" name="debug_dir" placeholder="输入 debug 目录绝对路径，例如 /data/debug/20240101"
+               class="input-path" required>
+        <button type="submit" class="btn btn-primary">导入</button>
+    </form>
+</section>
+
+<section class="card">
+    <h2>已导入的 Runs</h2>
+    {% if runs %}
+    <table class="runs-table">
+        <thead>
+            <tr>
+                <th>#</th>
+                <th>目录</th>
+                <th>导入时间</th>
+                <th>表数</th>
+                <th>记录数</th>
+                <th>状态</th>
+                <th>操作</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for run in runs %}
+            <tr>
+                <td>{{ run.id }}</td>
+                <td class="dir-cell" title="{{ run.debug_dir }}">{{ run.debug_dir }}</td>
+                <td>{{ run.imported_at }}</td>
+                <td>{{ run.table_count }}</td>
+                <td>{{ run.total_records }}</td>
+                <td><span class="badge badge-{{ run.status }}">{{ run.status }}</span></td>
+                <td class="actions">
+                    <a href="{{ url_for('run_detail', run_id=run.id) }}" class="btn btn-sm">详情</a>
+                    <button class="btn btn-sm btn-danger" onclick="deleteRun({{ run.id }}, this)">删除</button>
+                </td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p class="empty-hint">暂无导入记录，请先导入 Debug 目录。</p>
+    {% endif %}
+</section>
+{% endblock %}

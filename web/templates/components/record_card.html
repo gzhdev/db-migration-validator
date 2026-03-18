@@ -1,0 +1,33 @@
+{# Jinja2 macro — import and call from records.html if server-side rendering is needed #}
+{# Primary rendering is done client-side in app.js #}
+{% macro record_card(record) %}
+<div class="record-card" data-type="{{ record.match_type }}">
+    <div class="record-card-header" onclick="toggleCard(this)">
+        <span class="pk-label">主键: {{ record.primary_key }}</span>
+        <span class="badge badge-type-{{ record.match_type }}">{{ record.match_type }}</span>
+        <span class="toggle-arrow">▶</span>
+    </div>
+    <div class="record-card-body" style="display:none">
+        <div class="data-grid">
+            <div class="data-col raw-source">
+                <h4>原始数据</h4>
+                {% for k, v in record.raw_source.items() %}
+                <div class="field-row"><span class="fn">{{ k }}</span><span class="fv">{{ v }}</span></div>
+                {% endfor %}
+            </div>
+            <div class="data-col expected">
+                <h4>期望值</h4>
+                {% for k, v in record.expected_values.items() %}
+                <div class="field-row"><span class="fn">{{ k }}</span><span class="fv">{{ v }}</span></div>
+                {% endfor %}
+            </div>
+            <div class="data-col target">
+                <h4>目标值</h4>
+                {% for k, v in record.target_values.items() %}
+                <div class="field-row"><span class="fn">{{ k }}</span><span class="fv">{{ v }}</span></div>
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endmacro %}

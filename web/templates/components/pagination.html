@@ -1,0 +1,28 @@
+{# Jinja2 macro — primary pagination is rendered client-side in app.js #}
+{% macro pagination(current_page, total_pages, url_func) %}
+{% if total_pages > 1 %}
+<nav class="pagination">
+    {% if current_page > 1 %}
+    <a href="{{ url_func(current_page - 1) }}" class="page-btn">&laquo;</a>
+    {% else %}
+    <span class="page-btn disabled">&laquo;</span>
+    {% endif %}
+
+    {% for p in range(1, total_pages + 1) %}
+        {% if p == current_page %}
+        <span class="page-btn active">{{ p }}</span>
+        {% elif p <= 2 or p >= total_pages - 1 or (p >= current_page - 2 and p <= current_page + 2) %}
+        <a href="{{ url_func(p) }}" class="page-btn">{{ p }}</a>
+        {% elif p == 3 or p == total_pages - 2 %}
+        <span class="page-btn ellipsis">…</span>
+        {% endif %}
+    {% endfor %}
+
+    {% if current_page < total_pages %}
+    <a href="{{ url_func(current_page + 1) }}" class="page-btn">&raquo;</a>
+    {% else %}
+    <span class="page-btn disabled">&raquo;</span>
+    {% endif %}
+</nav>
+{% endif %}
+{% endmacro %}

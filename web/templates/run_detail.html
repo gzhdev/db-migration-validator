@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Run #{{ run.id }} — Debug Viewer{% endblock %}
+
+{% block content %}
+<div class="breadcrumb">
+    <a href="{{ url_for('index') }}">首页</a> &rsaquo; Run #{{ run.id }}
+</div>
+
+<h1 class="page-title">Run #{{ run.id }}</h1>
+<p class="meta">
+    目录：<code>{{ run.debug_dir }}</code> &nbsp;|&nbsp;
+    导入时间：{{ run.imported_at }} &nbsp;|&nbsp;
+    状态：<span class="badge badge-{{ run.status }}">{{ run.status }}</span>
+</p>
+
+<section class="card">
+    <div class="card-header">
+        <h2>表摘要</h2>
+        <a href="{{ url_for('records_page', run_id=run.id) }}" class="btn btn-primary">浏览所有记录</a>
+    </div>
+
+    {% if summaries %}
+    <table class="summary-table">
+        <thead>
+            <tr>
+                <th>表名</th>
+                <th>总行数</th>
+                <th class="col-match">匹配</th>
+                <th class="col-mismatch">不匹配</th>
+                <th class="col-missing">源缺失</th>
+                <th class="col-missing">目标缺失</th>
+                <th class="col-vc">取值失败</th>
+                <th>操作</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for s in summaries %}
+            <tr>
+                <td>{{ s.table_name }}</td>
+                <td>{{ s.total_rows }}</td>
+                <td class="col-match">{{ s.matched_rows }}</td>
+                <td class="col-mismatch {% if s.mismatched_rows > 0 %}has-issues{% endif %}">{{ s.mismatched_rows }}</td>
+                <td class="col-missing {% if s.missing_in_source > 0 %}has-issues{% endif %}">{{ s.missing_in_source }}</td>
+                <td class="col-missing {% if s.missing_in_target > 0 %}has-issues{% endif %}">{{ s.missing_in_target }}</td>
+                <td class="col-vc {% if s.value_check_failed > 0 %}has-issues{% endif %}">{{ s.value_check_failed }}</td>
+                <td>
+                    <a href="{{ url_for('records_page', run_id=run.id, table=s.table_name) }}" class="btn btn-sm">查看记录</a>
+                </td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p class="empty-hint">该 Run 暂无表摘要数据。</p>
+    {% endif %}
+</section>
+{% endblock %}
