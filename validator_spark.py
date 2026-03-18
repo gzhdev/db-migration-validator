@@ -16,9 +16,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from pyspark.sql import SparkSession, DataFrame, functions as F
-from pyspark.sql.types import StringType, DoubleType, IntegerType, BooleanType
-from pyspark.sql.functions import col, when, lit, concat_ws, upper, lower, trim, substring, regexp_replace, coalesce, to_json, from_json, expr
+# Spark Connect 模式：设置环境变量 SPARK_CONNECT_URL 启用（如 sc://localhost:15002）
+_SPARK_CONNECT_URL = os.environ.get("SPARK_CONNECT_URL", "").strip()
+
+if _SPARK_CONNECT_URL:
+    from pyspark.sql.connect.session import SparkSession
+    from pyspark.sql import DataFrame, functions as F
+    from pyspark.sql.types import StringType, DoubleType, IntegerType, BooleanType
+    from pyspark.sql.functions import col, when, lit, concat_ws, upper, lower, trim, substring, regexp_replace, coalesce, to_json, from_json, expr
+else:
+    from pyspark.sql import SparkSession, DataFrame, functions as F
+    from pyspark.sql.types import StringType, DoubleType, IntegerType, BooleanType
+    from pyspark.sql.functions import col, when, lit, concat_ws, upper, lower, trim, substring, regexp_replace, coalesce, to_json, from_json, expr
 
 # 配置日志
 logging.basicConfig(
@@ -112,7 +121,7 @@ class DebugConfig:
     """Debug 配置"""
     enabled: bool = False
     output_dir: str = "./debug"
-    formats: List[str] = field(default_factory=lambda: ["jsonl", "html"])
+    formats: List[str] = field(default_factory=lambda: ["jsonl"])
     max_records: int = 10000
     # record types
     include_matched: bool = False
@@ -137,7 +146,7 @@ class DebugConfig:
         return cls(
             enabled=config.get('enabled', False),
             output_dir=config.get('output_dir', './debug'),
-            formats=config.get('formats', ['jsonl', 'html']),
+            formats=config.get('formats', ['jsonl']),
             max_records=config.get('max_records', 10000),
             include_matched=record_types.get('matched', False),
             include_mismatched=record_types.get('mismatched', True),
@@ -225,348 +234,15 @@ class JsonlWriter:
         return self._record_count
 
 
-class HtmlReportGenerator:
-    """HTML 报告生成器"""
-
-    def __init__(self, output_path: str):
-        self.output_path = output_path
-        self._tables: Dict[str, Dict[str, Any]] = {}  # table_name -> {records, stats}
-
-    def add_table_records(self, table_name: str, records: List[Dict[str, Any]], stats: Dict[str, int]):
-        """添加表的记录和统计"""
-        self._tables[table_name] = {
-            'records': records,
-            'stats': stats
-        }
-
-    def generate(self):
-        """生成 HTML 报告"""
-        Path(self.output_path).parent.mkdir(parents=True, exist_ok=True)
-
-        html_content = self._generate_html()
-        with open(self.output_path, 'w', encoding='utf-8') as f:
-            f.write(html_content)
-
-        logger.info(f"HTML 报告已生成: {self.output_path}")
-
-    def _generate_html(self) -> str:
-        """生成完整 HTML 内容"""
-        return f'''<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Debug Report - 数据比对详细报告</title>
-    <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; padding: 20px; }}
-        .container {{ max-width: 1400px; margin: 0 auto; }}
-        h1 {{ color: #333; margin-bottom: 20px; padding-bottom: 10px; border-bottom: 2px solid #4CAF50; }}
-        .summary {{ background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-        .summary h2 {{ color: #333; margin-bottom: 15px; }}
-        .summary-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }}
-        .summary-item {{ background: #f8f9fa; padding: 15px; border-radius: 6px; text-align: center; }}
-        .summary-item .value {{ font-size: 24px; font-weight: bold; color: #4CAF50; }}
-        .summary-item .label {{ color: #666; font-size: 14px; }}
-        .table-section {{ background: white; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); overflow: hidden; }}
-        .table-header {{ background: #f8f9fa; padding: 15px 20px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }}
-        .table-header:hover {{ background: #e9ecef; }}
-        .table-header h3 {{ color: #333; }}
-        .table-stats {{ display: flex; gap: 20px; font-size: 14px; color: #666; }}
-        .table-stats span {{ padding: 2px 8px; border-radius: 4px; }}
-        .stat-matched {{ background: #d4edda; color: #155724; }}
-        .stat-mismatched {{ background: #f8d7da; color: #721c24; }}
-        .stat-missing {{ background: #fff3cd; color: #856404; }}
-        .table-content {{ padding: 20px; display: none; }}
-        .table-content.active {{ display: block; }}
-        .filter-bar {{ margin-bottom: 15px; display: flex; gap: 10px; flex-wrap: wrap; }}
-        .filter-btn {{ padding: 8px 16px; border: 1px solid #ddd; background: white; border-radius: 4px; cursor: pointer; }}
-        .filter-btn.active {{ background: #4CAF50; color: white; border-color: #4CAF50; }}
-        .search-box {{ padding: 8px 12px; border: 1px solid #ddd; border-radius: 4px; width: 200px; }}
-        .record {{ border: 1px solid #e0e0e0; border-radius: 6px; margin-bottom: 15px; overflow: hidden; }}
-        .record-header {{ background: #f8f9fa; padding: 10px 15px; display: flex; justify-content: space-between; align-items: center; }}
-        .record-type {{ padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: bold; }}
-        .type-matched {{ background: #d4edda; color: #155724; }}
-        .type-mismatched {{ background: #f8d7da; color: #721c24; }}
-        .type-missing_in_source {{ background: #fff3cd; color: #856404; }}
-        .type-missing_in_target {{ background: #fff3cd; color: #856404; }}
-        .type-value_check_failed {{ background: #cce5ff; color: #004085; }}
-        .record-body {{ padding: 15px; }}
-        .data-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; }}
-        .data-column {{ background: #fafafa; border-radius: 6px; padding: 12px; }}
-        .data-column h4 {{ color: #333; margin-bottom: 10px; padding-bottom: 5px; border-bottom: 1px solid #e0e0e0; font-size: 14px; }}
-        .data-column.raw-source h4 {{ color: #1976D2; }}
-        .data-column.expected h4 {{ color: #388E3C; }}
-        .data-column.target h4 {{ color: #F57C00; }}
-        .field-row {{ display: flex; padding: 6px 0; border-bottom: 1px solid #eee; }}
-        .field-row:last-child {{ border-bottom: none; }}
-        .field-name {{ flex: 0 0 100px; font-weight: 500; color: #666; font-size: 13px; }}
-        .field-value {{ flex: 1; color: #333; font-size: 13px; word-break: break-all; }}
-        .field-value.mismatch {{ background: #ffebee; padding: 2px 6px; border-radius: 3px; }}
-        .comparison-result {{ margin-top: 15px; padding: 10px; background: #fff3cd; border-radius: 6px; }}
-        .comparison-result h5 {{ color: #856404; margin-bottom: 8px; }}
-        .mismatch-item {{ padding: 5px 0; font-size: 13px; }}
-        .mismatch-item .expected {{ color: #388E3C; }}
-        .mismatch-item .actual {{ color: #D32F2F; }}
-        .no-records {{ text-align: center; color: #999; padding: 40px; }}
-        .toggle-icon {{ transition: transform 0.3s; }}
-        .toggle-icon.open {{ transform: rotate(180deg); }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Debug Report - 数据比对详细报告</h1>
-        <p style="color: #666; margin-bottom: 20px;">生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-
-        {self._generate_summary()}
-
-        {self._generate_table_sections()}
-    </div>
-
-    <script>
-        function toggleTable(header) {{
-            const content = header.nextElementSibling;
-            const icon = header.querySelector('.toggle-icon');
-            content.classList.toggle('active');
-            icon.classList.toggle('open');
-        }}
-
-        function filterRecords(tableId, type) {{
-            const container = document.getElementById(tableId);
-            const records = container.querySelectorAll('.record');
-            const buttons = container.querySelectorAll('.filter-btn');
-
-            buttons.forEach(btn => btn.classList.remove('active'));
-            event.target.classList.add('active');
-
-            records.forEach(record => {{
-                if (type === 'all' || record.dataset.type === type) {{
-                    record.style.display = 'block';
-                }} else {{
-                    record.style.display = 'none';
-                }}
-            }});
-        }}
-
-        function searchRecords(tableId, searchTerm) {{
-            const container = document.getElementById(tableId);
-            const records = container.querySelectorAll('.record');
-            const term = searchTerm.toLowerCase();
-
-            records.forEach(record => {{
-                const text = record.textContent.toLowerCase();
-                record.style.display = text.includes(term) ? 'block' : 'none';
-            }});
-        }}
-    </script>
-</body>
-</html>'''
-
-    def _generate_summary(self) -> str:
-        """生成摘要部分"""
-        total_records = sum(len(t['records']) for t in self._tables.values())
-        total_matched = sum(t['stats'].get('matched_rows', 0) for t in self._tables.values())
-        total_mismatched = sum(t['stats'].get('mismatched_rows', 0) for t in self._tables.values())
-        total_missing_source = sum(t['stats'].get('missing_in_source', 0) for t in self._tables.values())
-        total_missing_target = sum(t['stats'].get('missing_in_target', 0) for t in self._tables.values())
-
-        return f'''
-        <div class="summary">
-            <h2>总览</h2>
-            <div class="summary-grid">
-                <div class="summary-item">
-                    <div class="value">{len(self._tables)}</div>
-                    <div class="label">校验表数</div>
-                </div>
-                <div class="summary-item">
-                    <div class="value">{total_records}</div>
-                    <div class="label">Debug 记录数</div>
-                </div>
-                <div class="summary-item">
-                    <div class="value" style="color: #4CAF50;">{total_matched}</div>
-                    <div class="label">完全匹配</div>
-                </div>
-                <div class="summary-item">
-                    <div class="value" style="color: #f44336;">{total_mismatched}</div>
-                    <div class="label">字段不匹配</div>
-                </div>
-                <div class="summary-item">
-                    <div class="value" style="color: #ff9800;">{total_missing_target}</div>
-                    <div class="label">目标表缺失</div>
-                </div>
-                <div class="summary-item">
-                    <div class="value" style="color: #ff9800;">{total_missing_source}</div>
-                    <div class="label">源表缺失</div>
-                </div>
-            </div>
-        </div>'''
-
-    def _generate_table_sections(self) -> str:
-        """生成各表的详细部分"""
-        if not self._tables:
-            return '<div class="no-records">暂无 Debug 记录</div>'
-
-        sections = []
-        for idx, (table_name, data) in enumerate(self._tables.items()):
-            table_id = f"table-{idx}"
-            records = data['records']
-            stats = data['stats']
-
-            # 统计徽章
-            stat_badges = []
-            if stats.get('matched_rows', 0) > 0:
-                stat_badges.append(f'<span class="stat-matched">匹配: {stats["matched_rows"]}</span>')
-            if stats.get('mismatched_rows', 0) > 0:
-                stat_badges.append(f'<span class="stat-mismatched">不匹配: {stats["mismatched_rows"]}</span>')
-            if stats.get('missing_in_target', 0) > 0:
-                stat_badges.append(f'<span class="stat-missing">目标缺失: {stats["missing_in_target"]}</span>')
-            if stats.get('missing_in_source', 0) > 0:
-                stat_badges.append(f'<span class="stat-missing">源缺失: {stats["missing_in_source"]}</span>')
-
-            section = f'''
-        <div class="table-section">
-            <div class="table-header" onclick="toggleTable(this)">
-                <h3>{table_name}</h3>
-                <div>
-                    <span class="table-stats">{' '.join(stat_badges)}</span>
-                    <span class="toggle-icon">▼</span>
-                </div>
-            </div>
-            <div class="table-content">
-                <div class="filter-bar">
-                    <button class="filter-btn active" onclick="filterRecords('{table_id}', 'all')">全部</button>
-                    <button class="filter-btn" onclick="filterRecords('{table_id}', 'mismatched')">不匹配</button>
-                    <button class="filter-btn" onclick="filterRecords('{table_id}', 'missing_in_target')">目标缺失</button>
-                    <button class="filter-btn" onclick="filterRecords('{table_id}', 'missing_in_source')">源缺失</button>
-                    <button class="filter-btn" onclick="filterRecords('{table_id}', 'value_check_failed')">取值失败</button>
-                    <input type="text" class="search-box" placeholder="搜索..." oninput="searchRecords('{table_id}', this.value)">
-                </div>
-                <div id="{table_id}">
-                    {self._generate_records(records)}
-                </div>
-            </div>
-        </div>'''
-            sections.append(section)
-
-        return '\n'.join(sections)
-
-    def _generate_records(self, records: List[Dict[str, Any]]) -> str:
-        """生成记录列表"""
-        if not records:
-            return '<div class="no-records">暂无记录</div>'
-
-        html_records = []
-        for record in records:
-            record_type = record.get('match_type', 'unknown')
-            pk = record.get('primary_key', {})
-            pk_str = ', '.join(f'{k}={v}' for k, v in pk.items()) if isinstance(pk, dict) else str(pk)
-
-            # 生成三列数据
-            raw_source_html = self._generate_data_column('原始数据', record.get('raw_source', {}), 'raw-source')
-            expected_html = self._generate_data_column('期望值', record.get('expected_values', {}), 'expected')
-            target_html = self._generate_data_column('目标值', record.get('target_values', {}), 'target')
-
-            # 比对结果
-            comparison_html = ''
-            comparison_result = record.get('comparison_result', {})
-            if comparison_result:
-                mismatch_items = []
-                for field, result in comparison_result.items():
-                    if not result.get('match', True):
-                        mismatch_items.append(f'''
-                        <div class="mismatch-item">
-                            <strong>{field}</strong>:
-                            <span class="expected">期望: {self._format_value(result.get('expected'))}</span> |
-                            <span class="actual">实际: {self._format_value(result.get('actual'))}</span>
-                        </div>''')
-                if mismatch_items:
-                    comparison_html = f'''
-                <div class="comparison-result">
-                    <h5>字段差异</h5>
-                    {''.join(mismatch_items)}
-                </div>'''
-
-            # 取值范围校验失败
-            value_failures = record.get('value_check_failures', [])
-            if value_failures:
-                failure_items = []
-                for failure in value_failures:
-                    reasons = ', '.join(failure.get('reasons', []))
-                    failure_items.append(f'''
-                    <div class="mismatch-item">
-                        <strong>{failure.get('field')}</strong>:
-                        值: {self._format_value(failure.get('value'))} - {reasons}
-                    </div>''')
-                if failure_items:
-                    comparison_html += f'''
-                <div class="comparison-result" style="background: #cce5ff;">
-                    <h5 style="color: #004085;">取值范围校验失败</h5>
-                    {''.join(failure_items)}
-                </div>'''
-
-            record_html = f'''
-            <div class="record" data-type="{record_type}">
-                <div class="record-header">
-                    <span>主键: {pk_str}</span>
-                    <span class="record-type type-{record_type}">{self._get_type_label(record_type)}</span>
-                </div>
-                <div class="record-body">
-                    <div class="data-grid">
-                        {raw_source_html}
-                        {expected_html}
-                        {target_html}
-                    </div>
-                    {comparison_html}
-                </div>
-            </div>'''
-            html_records.append(record_html)
-
-        return '\n'.join(html_records)
-
-    def _generate_data_column(self, title: str, data: Dict[str, Any], css_class: str) -> str:
-        """生成数据列"""
-        rows = []
-        for field, value in data.items():
-            formatted_value = self._format_value(value)
-            rows.append(f'''
-                    <div class="field-row">
-                        <span class="field-name">{field}</span>
-                        <span class="field-value">{formatted_value}</span>
-                    </div>''')
-
-        return f'''
-                    <div class="data-column {css_class}">
-                        <h4>{title}</h4>
-                        {''.join(rows) if rows else '<div style="color: #999; font-size: 13px;">暂无数据</div>'}
-                    </div>'''
-
-    def _format_value(self, value: Any) -> str:
-        """格式化值"""
-        if value is None:
-            return '<span style="color: #999;">NULL</span>'
-        return _fmt_value(value)[:200]
-
-    def _get_type_label(self, record_type: str) -> str:
-        """获取类型标签"""
-        labels = {
-            'matched': '完全匹配',
-            'mismatched': '字段不匹配',
-            'missing_in_source': '源表缺失',
-            'missing_in_target': '目标表缺失',
-            'value_check_failed': '取值失败'
-        }
-        return labels.get(record_type, record_type)
 
 
 class DebugExporter:
-    """主 Debug 导出器 - 协调 JSONL 和 HTML 输出"""
+    """主 Debug 导出器 - 协调 JSONL 输出"""
 
     def __init__(self, config: DebugConfig):
         self.config = config
         self._jsonl_writer: Optional[JsonlWriter] = None
-        self._html_generator: Optional[HtmlReportGenerator] = None
         self._current_table: str = ""
-        self._current_records: List[Dict[str, Any]] = []
         self._record_counter: int = 0
         self._table_counter: int = 0
 
@@ -578,12 +254,6 @@ class DebugExporter:
         # 创建输出目录
         Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
 
-        # 初始化 HTML 生成器
-        if 'html' in self.config.formats:
-            timestamp = datetime.now().strftime('%Y%m%d')
-            html_path = Path(self.config.output_dir) / f"debug_report_{timestamp}.html"
-            self._html_generator = HtmlReportGenerator(str(html_path))
-
         logger.info(f"Debug 导出器已启动, 输出目录: {self.config.output_dir}")
 
     def start_table(self, table_name: str, mapping: 'TableMapping'):
@@ -592,7 +262,6 @@ class DebugExporter:
             return
 
         self._current_table = table_name
-        self._current_records = []
         self._table_counter += 1
 
         # 创建表的 JSONL 写入器
@@ -694,10 +363,6 @@ class DebugExporter:
         if self._jsonl_writer:
             self._jsonl_writer.write_record(record.to_dict())
 
-        # 缓存到 HTML 记录 (限制数量避免内存问题)
-        if self._html_generator and len(self._current_records) < 1000:
-            self._current_records.append(record.to_dict())
-
     def end_table(self, stats: Dict[str, int]):
         """结束表处理"""
         if not self.config.enabled:
@@ -714,21 +379,12 @@ class DebugExporter:
             with open(summary_path, 'w', encoding='utf-8') as f:
                 json.dump(stats, f, ensure_ascii=False, indent=2)
 
-        # 添加到 HTML 生成器
-        if self._html_generator:
-            self._html_generator.add_table_records(self._current_table, self._current_records, stats)
-
-        logger.debug(f"完成 Debug 记录表: {self._current_table}, 记录数: {len(self._current_records)}")
-        self._current_records = []
+        logger.debug(f"完成 Debug 记录表: {self._current_table}")
 
     def close(self):
         """关闭导出器"""
         if not self.config.enabled:
             return
-
-        # 生成 HTML 报告
-        if self._html_generator:
-            self._html_generator.generate()
 
         logger.info(f"Debug 导出完成, 共 {self._record_counter} 条记录")
 
@@ -932,16 +588,20 @@ class SparkDataValidator:
         self.debug_exporter = DebugExporter(self.debug_config)
     
     def _create_spark_session(self) -> SparkSession:
-        """创建 Spark Session"""
+        """创建 Spark Session（支持 Spark Connect 模式）"""
+        if _SPARK_CONNECT_URL:
+            logger.info(f"使用 Spark Connect 模式: {_SPARK_CONNECT_URL}")
+            return SparkSession.builder.remote(_SPARK_CONNECT_URL).getOrCreate()
+
         builder = SparkSession.builder \
             .appName("DB-Migration-Validator") \
             .config("spark.sql.adaptive.enabled", "true") \
             .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-        
+
         # 可以根据需要添加更多配置
         # .config("spark.executor.memory", "4g") \
         # .config("spark.driver.memory", "2g") \
-        
+
         return builder.getOrCreate()
     
     def _get_jdbc_url(self, db_config: Dict[str, Any]) -> str:
@@ -2109,8 +1769,8 @@ class SparkDataValidator:
             logger.info(f"Markdown 报告已生成: {report_file}")
     
     def stop(self):
-        """停止 Spark Session"""
-        if self.spark:
+        """停止 Spark Session（Spark Connect 模式下不停止远程服务）"""
+        if self.spark and not _SPARK_CONNECT_URL:
             self.spark.stop()
 
 
@@ -2137,12 +1797,17 @@ def main():
     # 加载配置
     config = load_config(config_path)
     
-    # 创建 Spark 配置
-    spark_builder = SparkSession.builder.appName("DB-Migration-Validator")
-    if master:
-        spark_builder = spark_builder.master(master)
-    
-    spark = spark_builder.getOrCreate()
+    # 创建 Spark 会话（Spark Connect 优先）
+    if _SPARK_CONNECT_URL:
+        logger.info(f"使用 Spark Connect 模式: {_SPARK_CONNECT_URL}")
+        if master:
+            logger.warning("--master 参数在 Spark Connect 模式下被忽略，请通过 SPARK_CONNECT_URL 指定连接地址")
+        spark = SparkSession.builder.remote(_SPARK_CONNECT_URL).getOrCreate()
+    else:
+        spark_builder = SparkSession.builder.appName("DB-Migration-Validator")
+        if master:
+            spark_builder = spark_builder.master(master)
+        spark = spark_builder.getOrCreate()
     
     # 创建校验器
     validator = SparkDataValidator(config, spark)

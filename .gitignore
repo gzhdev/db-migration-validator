@@ -51,3 +51,6 @@ local_config.json
 Thumbs.db
 
 logs/
+
+# Web viewer database
+web/debug_viewer.db
