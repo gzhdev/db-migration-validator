@@ -32,6 +32,21 @@
             <button class="btn btn-filter {% if selected_type == 'matched' %}active{% endif %}" data-type="matched">匹配</button>
         </div>
     </div>
+    <div class="filter-group filter-group--right">
+        <label>主键搜索</label>
+        <div class="pk-search-wrap">
+            <input type="text" id="filter-pk" class="input-pk" placeholder="输入主键值…">
+            <button class="btn btn-pk-clear" id="btn-pk-clear" title="清除">&#x2715;</button>
+        </div>
+    </div>
+    <div class="filter-group">
+        <label>每页</label>
+        <select id="filter-page-size" class="select-page-size">
+            <option value="20">20 条</option>
+            <option value="50">50 条</option>
+            <option value="100">100 条</option>
+        </select>
+    </div>
 </div>
 
 <!-- 记录列表（JS 填充） -->
@@ -43,7 +58,7 @@
 <div id="pagination-container"></div>
 {% endblock %}
 
-{% block extra_js %}
+{% block page_data %}
 <script>
     window.RUN_ID = {{ run.id }};
 </script>

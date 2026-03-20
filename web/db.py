@@ -163,7 +163,7 @@ def insert_records_batch(rows: list):
 
 
 def query_records(run_id: int, table_name: str = None, match_type: str = None,
-                  page: int = 1, page_size: int = 20) -> dict:
+                  pk_search: str = None, page: int = 1, page_size: int = 20) -> dict:
     conditions = ["run_id = ?"]
     params = [run_id]
 
@@ -173,6 +173,9 @@ def query_records(run_id: int, table_name: str = None, match_type: str = None,
     if match_type:
         conditions.append("match_type = ?")
         params.append(match_type)
+    if pk_search:
+        conditions.append("primary_key LIKE ?")
+        params.append(f"%{pk_search}%")
 
     where = " AND ".join(conditions)
     offset = (page - 1) * page_size

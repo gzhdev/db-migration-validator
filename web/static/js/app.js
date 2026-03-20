@@ -146,27 +146,33 @@ function renderPagination(current, total, onClick) {
         const table = document.getElementById('filter-table').value;
         const activeBtn = document.querySelector('#filter-type .btn-filter.active');
         const matchType = activeBtn ? activeBtn.dataset.type : '';
-        return { table, matchType };
+        const pageSizeEl = document.getElementById('filter-page-size');
+        const pageSize = pageSizeEl ? parseInt(pageSizeEl.value, 10) : 20;
+        const pkSearch = (document.getElementById('filter-pk') || {}).value || '';
+        return { table, matchType, pageSize, pkSearch: pkSearch.trim() };
     }
 
     function buildApiUrl(page) {
-        const { table, matchType } = getFilters();
-        const params = new URLSearchParams({ page, page_size: 20 });
+        const { table, matchType, pageSize, pkSearch } = getFilters();
+        const params = new URLSearchParams({ page, page_size: pageSize });
         if (table)     params.set('table', table);
         if (matchType) params.set('match_type', matchType);
+        if (pkSearch)  params.set('pk_search', pkSearch);
         return `/api/runs/${runId}/records?${params}`;
     }
 
     function buildPageUrl(page) {
-        const { table, matchType } = getFilters();
-        const params = new URLSearchParams({ page });
+        const { table, matchType, pageSize, pkSearch } = getFilters();
+        const params = new URLSearchParams({ page, page_size: pageSize });
         if (table)     params.set('table', table);
         if (matchType) params.set('match_type', matchType);
+        if (pkSearch)  params.set('pk_search', pkSearch);
         return `?${params}`;
     }
 
     function pushState(page) {
-        history.pushState({ page }, '', buildPageUrl(page));
+        const { pageSize, pkSearch } = getFilters();
+        history.pushState({ page, pageSize, pkSearch }, '', buildPageUrl(page));
     }
 
     async function loadRecords(page) {
@@ -215,14 +221,50 @@ function renderPagination(current, total, onClick) {
         });
     });
 
+    const pageSizeEl = document.getElementById('filter-page-size');
+    if (pageSizeEl) {
+        pageSizeEl.addEventListener('change', onFilterChange);
+    }
+
+    // 主键搜索：防抖 400ms 后触发
+    const pkInput = document.getElementById('filter-pk');
+    const pkClearBtn = document.getElementById('btn-pk-clear');
+    let pkDebounceTimer = null;
+    if (pkInput) {
+        pkInput.addEventListener('input', () => {
+            clearTimeout(pkDebounceTimer);
+            pkClearBtn.style.display = pkInput.value ? 'inline-block' : 'none';
+            pkDebounceTimer = setTimeout(onFilterChange, 400);
+        });
+        pkInput.addEventListener('keydown', e => {
+            if (e.key === 'Enter') { clearTimeout(pkDebounceTimer); onFilterChange(); }
+        });
+    }
+    if (pkClearBtn) {
+        pkClearBtn.style.display = 'none';
+        pkClearBtn.addEventListener('click', () => {
+            pkInput.value = '';
+            pkClearBtn.style.display = 'none';
+            onFilterChange();
+        });
+    }
+
     window.addEventListener('popstate', e => {
         const p = (e.state && e.state.page) || 1;
+        const ps = (e.state && e.state.pageSize);
+        if (ps && pageSizeEl) pageSizeEl.value = String(ps);
+        const pk = (e.state && e.state.pkSearch) || '';
+        if (pkInput) { pkInput.value = pk; if (pkClearBtn) pkClearBtn.style.display = pk ? 'inline-block' : 'none'; }
         loadRecords(p);
     });
 
-    // Initial page from URL
+    // Initial state from URL
     const initParams = new URLSearchParams(location.search);
     const initPage = parseInt(initParams.get('page') || '1', 10);
+    const initPageSize = initParams.get('page_size');
+    if (initPageSize && pageSizeEl) pageSizeEl.value = initPageSize;
+    const initPk = initParams.get('pk_search') || '';
+    if (initPk && pkInput) { pkInput.value = initPk; if (pkClearBtn) pkClearBtn.style.display = 'inline-block'; }
     loadRecords(initPage);
 })();
 

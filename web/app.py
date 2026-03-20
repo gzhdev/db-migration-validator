@@ -71,6 +71,7 @@ def api_records(run_id):
         abort(404)
     table = request.args.get("table", "")
     match_type = request.args.get("match_type", "")
+    pk_search = request.args.get("pk_search", "").strip()
     try:
         page = int(request.args.get("page", 1))
         page_size = int(request.args.get("page_size", 20))
@@ -81,6 +82,7 @@ def api_records(run_id):
         run_id,
         table_name=table or None,
         match_type=match_type or None,
+        pk_search=pk_search or None,
         page=page,
         page_size=page_size,
     )

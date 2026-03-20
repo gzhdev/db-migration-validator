@@ -20,10 +20,14 @@ from typing import Any, Dict, List, Optional, Tuple
 _SPARK_CONNECT_URL = os.environ.get("SPARK_CONNECT_URL", "").strip()
 
 if _SPARK_CONNECT_URL:
+    # Spark Connect 模式：必须使用 connect 专属的 functions 模块
+    # 经典 pyspark.sql.functions 内部检查 SparkContext._active_spark_context，
+    # 而 Spark Connect 无本地 SparkContext，调用 lit/when/col 等会抛 AssertionError
     from pyspark.sql.connect.session import SparkSession
-    from pyspark.sql import DataFrame, functions as F
+    from pyspark.sql.connect.dataframe import DataFrame
+    from pyspark.sql.connect import functions as F
+    from pyspark.sql.connect.functions import col, when, lit, concat_ws, upper, lower, trim, substring, regexp_replace, coalesce, to_json, from_json, expr
     from pyspark.sql.types import StringType, DoubleType, IntegerType, BooleanType
-    from pyspark.sql.functions import col, when, lit, concat_ws, upper, lower, trim, substring, regexp_replace, coalesce, to_json, from_json, expr
 else:
     from pyspark.sql import SparkSession, DataFrame, functions as F
     from pyspark.sql.types import StringType, DoubleType, IntegerType, BooleanType
@@ -487,9 +491,12 @@ class DebugExporter:
         """提取目标值"""
         target = {}
         for fm in mapping.field_mappings:
-            # 以字段存在性判断，优先带 t. 前缀（join 后列名格式）
+            # 优先使用 _target_* 专用列（join 前预先添加，名称唯一，不受 alias/同名列影响）
+            dedicated_col = f"_target_{fm.target_field}"
             t_col = f"t.{fm.target_field}"
-            if t_col in row_fields:
+            if dedicated_col in row_fields:
+                target[fm.target_field] = _fmt_value(row[dedicated_col])
+            elif t_col in row_fields:
                 target[fm.target_field] = _fmt_value(row[t_col])
             elif fm.target_field in row_fields:
                 target[fm.target_field] = _fmt_value(row[fm.target_field])
@@ -512,8 +519,11 @@ class DebugExporter:
                 else:
                     expected_val = None
 
+                dedicated_col = f"_target_{fm.target_field}"
                 t_col = f"t.{fm.target_field}"
-                if t_col in row_fields:
+                if dedicated_col in row_fields:
+                    actual_val = row[dedicated_col]
+                elif t_col in row_fields:
                     actual_val = row[t_col]
                 elif fm.target_field in row_fields:
                     actual_val = row[fm.target_field]
@@ -534,9 +544,12 @@ class DebugExporter:
             check_col = f"_value_check_{fm.target_field}"
             is_passed = self._get_row_value(row, check_col, row_fields)
             if is_passed is False:
-                # 以字段存在性判断获取字段值，避免 NULL 值触发 fallback
+                # 优先使用 _target_* 专用列，避免同名列或 alias 格式不一致
+                dedicated_col = f"_target_{fm.target_field}"
                 t_col = f"t.{fm.target_field}"
-                if t_col in row_fields:
+                if dedicated_col in row_fields:
+                    field_value = row[dedicated_col]
+                elif t_col in row_fields:
                     field_value = row[t_col]
                 elif fm.target_field in row_fields:
                     field_value = row[fm.target_field]
@@ -1002,13 +1015,17 @@ class SparkDataValidator:
                     bounds_query = f"(SELECT MIN({pk_field}) as min_val, MAX({pk_field}) as max_val FROM {table}) {alias_prefix}bounds"
                     bounds_df = self.spark.read.jdbc(url=jdbc_url, table=bounds_query, properties=props)
                     bounds = bounds_df.first()
-                    if bounds and bounds['min_val'] is not None:
+                    # 用位置索引避免列名大小写问题（Oracle JDBC 返回大写列名）
+                    # 只对 numeric/date/timestamp 类型列启用分区，字符串主键不支持
+                    if bounds and bounds[0] is not None and isinstance(bounds[0], (int, float, decimal.Decimal)):
                         options['partitionColumn'] = pk_field
-                        options['lowerBound'] = bounds['min_val']
-                        options['upperBound'] = bounds['max_val']
+                        options['lowerBound'] = bounds[0]
+                        options['upperBound'] = bounds[1]
                         options['numPartitions'] = max(4, mapping.batch_size // 10000)
+                    elif bounds and bounds[0] is not None:
+                        logger.debug(f"主键 {pk_field} 为非数值类型 ({type(bounds[0]).__name__})，跳过分区读取")
                 except Exception as e:
-                    logger.warning(f"无法获取分区边界，使用默认读取: {e}")
+                    logger.warning(f"无法获取分区边界，使用默认读取: {e}", exc_info=True)
 
         df = self.spark.read.format("jdbc").options(**options).load()
 
@@ -1058,13 +1075,17 @@ class SparkDataValidator:
                 bounds_query = f"(SELECT MIN({pk_fields[0]}) as min_val, MAX({pk_fields[0]}) as max_val FROM {table}) {alias_prefix}bounds"
                 bounds_df = self.spark.read.jdbc(url=jdbc_url, table=bounds_query, properties=props)
                 bounds = bounds_df.first()
-                if bounds and bounds['min_val'] is not None:
+                # 用位置索引避免列名大小写问题（Oracle JDBC 返回大写列名）
+                # 只对 numeric/date/timestamp 类型列启用分区，字符串主键不支持
+                if bounds and bounds[0] is not None and isinstance(bounds[0], (int, float, decimal.Decimal)):
                     options['partitionColumn'] = pk_fields[0]
-                    options['lowerBound'] = bounds['min_val']
-                    options['upperBound'] = bounds['max_val']
+                    options['lowerBound'] = bounds[0]
+                    options['upperBound'] = bounds[1]
                     options['numPartitions'] = max(4, mapping.batch_size // 10000)
+                elif bounds and bounds[0] is not None:
+                    logger.debug(f"主键 {pk_fields[0]} 为非数值类型 ({type(bounds[0]).__name__})，跳过分区读取")
             except Exception as e:
-                logger.warning(f"无法获取分区边界，使用默认读取: {e}")
+                logger.warning(f"无法获取分区边界，使用默认读取: {e}", exc_info=True)
         
         df = self.spark.read.format("jdbc").options(**options).load()
         return df
@@ -1237,6 +1258,7 @@ class SparkDataValidator:
         # 保存源表列名 (用于 debug 导出)
         source_columns = []
         raw_source_columns = []  # 原始源表列名 (用于提取 raw_source)
+        _persisted = []  # 记录已缓存的 DataFrame，用于异常路径清理
 
         try:
             logger.info(f"读取源表: {source_desc}")
@@ -1270,11 +1292,22 @@ class SparkDataValidator:
             
             source_with_expected = source_with_expected.withColumn("_source_pk", F.struct(*source_pk_cols))
             target_df = target_df.withColumn("_target_pk", F.struct(*target_pk_cols))
+
+            # 在 join 前为 target 每个字段添加 _target_* 专用列
+            # 原因：join+collect 后 Row.__fields__ 不含 alias 前缀，t.field 检查永远失败；
+            # 同名列 fallback 会取到 source 侧的值（或 Spark Connect 下字段名含 ExprId 导致空值）
+            for _fm in mapping.field_mappings:
+                target_df = target_df.withColumn(f"_target_{_fm.target_field}", col(_fm.target_field))
             
-            # 缓存数据
-            source_with_expected.persist()
-            target_df.persist()
-            
+            # 缓存数据（Spark Connect 旧版本可能不支持 persist，容错处理）
+            _persisted = []
+            try:
+                source_with_expected.persist()
+                target_df.persist()
+                _persisted = [source_with_expected, target_df]
+            except Exception as persist_err:
+                logger.warning(f"persist() 不可用，跳过缓存（Spark Connect 兼容性问题）: {persist_err}")
+
             # 统计记录数 (触发缓存)
             source_count = source_with_expected.count()
             result.total_rows = source_count
@@ -1339,6 +1372,13 @@ class SparkDataValidator:
                 all_match_expr = all_match_expr & c
 
             classified_df = classified_df.withColumn("_all_fields_match", all_match_expr)
+
+            # 缓存 classified_df，后续多次 collect 不会重复执行 FULL JOIN
+            try:
+                classified_df.persist()
+                _persisted.append(classified_df)
+            except Exception as persist_err:
+                logger.warning(f"classified_df persist() 不可用: {persist_err}")
 
             # ========== 取值范围校验 ==========
             value_check_fields = [fm for fm in mapping.field_mappings
@@ -1585,8 +1625,11 @@ class SparkDataValidator:
                     })
 
             # 清理缓存
-            source_with_expected.unpersist()
-            target_df.unpersist()
+            for _df in _persisted:
+                try:
+                    _df.unpersist()
+                except Exception:
+                    pass
 
             result.status = "completed"
             logger.info(f"完成表 {source_desc} 校验")
@@ -1603,12 +1646,18 @@ class SparkDataValidator:
                 })
 
         except Exception as e:
-            logger.error(f"校验表 {source_desc} 时出错: {e}")
+            logger.error(f"校验表 {source_desc} 时出错: {e}", exc_info=True)
             result.status = "error"
             result.errors.append({
                 'type': 'exception',
                 'error': str(e)
             })
+            # 清理缓存（异常路径）
+            for _df in _persisted:
+                try:
+                    _df.unpersist()
+                except Exception:
+                    pass
         
         result.duration_seconds = (datetime.now() - start_time).total_seconds()
         return result
