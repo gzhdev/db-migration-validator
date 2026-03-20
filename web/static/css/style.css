@@ -103,7 +103,7 @@ main.container { padding-top: 24px; padding-bottom: 40px; }
 .data-col.target h4 { color: #e65100; }
 .field-row { display: flex; padding: 4px 0; border-bottom: 1px solid #eee; font-size: 12px; }
 .field-row:last-child { border-bottom: none; }
-.fn { flex: 0 0 110px; font-weight: 500; color: #666; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-right: 6px; }
+.fn { flex: 0 0 110px; font-weight: 500; color: #666; word-break: break-all; overflow-wrap: break-word; padding-right: 6px; }
 .fv { flex: 1; color: #333; word-break: break-all; }
 .fv.mismatch { background: #ffebee; padding: 1px 4px; border-radius: 3px; color: #c62828; }
 .fv-null { color: #bbb; font-style: italic; }
