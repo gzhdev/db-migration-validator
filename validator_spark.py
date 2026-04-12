@@ -325,7 +325,7 @@ class DebugExporter:
         # 提取原始源数据
         raw_source = {}
         if self.config.include_raw_source and match_type != 'missing_in_source':
-            raw_source = self._extract_raw_source(row, source_columns, row_fields)
+            raw_source = self._extract_raw_source(row, source_columns, row_fields, field_alias_map)
             logger.debug(f"extracted raw_source: {raw_source}")
 
         # 提取期望值
@@ -461,16 +461,29 @@ class DebugExporter:
 
         return pk_dict if pk_dict else {'pk': 'unknown'}
 
-    def _extract_raw_source(self, row: Any, source_columns: List[str], row_fields: List[str]) -> Dict[str, Any]:
-        """提取原始源数据"""
+    def _extract_raw_source(self, row: Any, source_columns: List[str], row_fields: List[str],
+                            field_alias_map: Dict[str, str] = None) -> Dict[str, Any]:
+        """提取原始源数据，多表模式下 key 还原为 alias.field 格式"""
+        # 构建反向映射: alias_field -> alias.field (仅多表模式下有实际映射)
+        reverse_alias_map = {}
+        if field_alias_map:
+            for dotted, col_name in field_alias_map.items():
+                if '.' in dotted:  # 只处理多表别名字段
+                    reverse_alias_map[col_name] = dotted
+
         raw_source = {}
         for col_name in source_columns:
             # 尝试不同的列名格式 (join 后列名带 s. 前缀)，以字段存在性判断而非值是否为 None
             col_with_prefix = f"s.{col_name}"
             if col_with_prefix in row_fields:
-                raw_source[col_name] = _fmt_value(row[col_with_prefix])
+                value = _fmt_value(row[col_with_prefix])
             elif col_name in row_fields:
-                raw_source[col_name] = _fmt_value(row[col_name])
+                value = _fmt_value(row[col_name])
+            else:
+                continue
+            # 多表模式: 还原 key 为 alias.field 格式
+            display_key = reverse_alias_map.get(col_name, col_name)
+            raw_source[display_key] = value
 
         return raw_source
 

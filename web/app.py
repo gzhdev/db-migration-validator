@@ -1,4 +1,6 @@
-from flask import Flask, render_template, request, redirect, url_for, jsonify, abort
+import os
+
+from flask import Flask, render_template, request, redirect, url_for, jsonify, abort, send_file
 
 import db
 import importer
@@ -58,6 +60,29 @@ def records_page(run_id):
         selected_table=selected_table,
         selected_type=selected_type,
     )
+
+
+@app.route("/mapping-generator")
+def mapping_generator():
+    return render_template("mapping_generator.html")
+
+
+@app.route("/api/csv-template")
+def csv_template():
+    csv_path = os.path.join(
+        os.path.dirname(__file__), os.pardir,
+        ".claude", "skills", "resources", "gen-mapping", "csv_template.csv"
+    )
+    csv_path = os.path.normpath(csv_path)
+    if os.path.isfile(csv_path):
+        return send_file(csv_path, mimetype="text/csv", as_attachment=True,
+                         download_name="csv_template.csv")
+    # Fallback: inline minimal template
+    header = ("source_table,target_table,source_field,target_field,is_primary_key,"
+              "transform_type,transform_fields,transform_params,compare_rule,"
+              "tolerance,nullable,description\n")
+    return header, 200, {"Content-Type": "text/csv",
+                         "Content-Disposition": "attachment; filename=csv_template.csv"}
 
 
 # ---------------------------------------------------------------------------

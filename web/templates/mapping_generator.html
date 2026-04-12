@@ -1,0 +1,332 @@
+{% extends "base.html" %}
+{% block title %}映射配置生成器{% endblock %}
+
+{% block content %}
+<h1 class="page-title">映射配置生成器</h1>
+
+<!-- CSV 导入 -->
+<section class="card mg-section">
+    <h2>导入 CSV</h2>
+    <p class="meta">上传字段映射 CSV 文件快速生成配置，或在下方手动编辑。</p>
+    <div class="mg-csv-import">
+        <input type="file" id="csv-file" accept=".csv" class="input-path">
+        <button class="btn btn-primary" onclick="MG.importCSV()">解析 CSV</button>
+        <a href="/api/csv-template" class="btn btn-sm" download="csv_template.csv">下载 CSV 模板</a>
+    </div>
+    <div id="csv-error" class="alert alert-error" style="display:none"></div>
+</section>
+
+<!-- 数据库连接 -->
+<section class="card mg-section">
+    <div class="card-header">
+        <h2>数据库连接</h2>
+        <button class="btn btn-sm" onclick="MG.toggleSection('db-section')">折叠/展开</button>
+    </div>
+    <div id="db-section">
+        <div class="mg-db-grid">
+            <div class="mg-db-col">
+                <h3>源数据库</h3>
+                <div class="mg-form-group">
+                    <label>类型</label>
+                    <select id="src-type">
+                        <option value="mysql">MySQL</option>
+                        <option value="postgresql">PostgreSQL</option>
+                        <option value="oracle">Oracle</option>
+                        <option value="sqlite">SQLite</option>
+                    </select>
+                </div>
+                <div class="mg-form-group"><label>Host</label><input type="text" id="src-host" placeholder="192.168.1.100"></div>
+                <div class="mg-form-group"><label>Port</label><input type="number" id="src-port" placeholder="3306"></div>
+                <div class="mg-form-group"><label>Database</label><input type="text" id="src-database" placeholder="legacy_db"></div>
+                <div class="mg-form-group"><label>User</label><input type="text" id="src-user" placeholder="readonly_user"></div>
+                <div class="mg-form-group"><label>Password 环境变量</label><input type="text" id="src-password-env" placeholder="SOURCE_DB_PASSWORD"></div>
+                <!-- Oracle 专用 -->
+                <div class="mg-oracle-fields" style="display:none" data-db="src">
+                    <div class="mg-form-group"><label>Service Name</label><input type="text" id="src-service-name" placeholder="ORCL"></div>
+                    <div class="mg-form-group"><label>SID</label><input type="text" id="src-sid" placeholder="与 service_name 二选一"></div>
+                    <div class="mg-form-group">
+                        <label><input type="checkbox" id="src-thick-mode"> Thick 模式</label>
+                    </div>
+                    <div class="mg-form-group"><label>Oracle Client 路径</label><input type="text" id="src-oracle-client" placeholder="/opt/oracle/instantclient"></div>
+                </div>
+            </div>
+            <div class="mg-db-col">
+                <h3>目标数据库</h3>
+                <div class="mg-form-group">
+                    <label>类型</label>
+                    <select id="tgt-type">
+                        <option value="mysql">MySQL</option>
+                        <option value="postgresql" selected>PostgreSQL</option>
+                        <option value="oracle">Oracle</option>
+                        <option value="sqlite">SQLite</option>
+                    </select>
+                </div>
+                <div class="mg-form-group"><label>Host</label><input type="text" id="tgt-host" placeholder="192.168.1.200"></div>
+                <div class="mg-form-group"><label>Port</label><input type="number" id="tgt-port" placeholder="5432"></div>
+                <div class="mg-form-group"><label>Database</label><input type="text" id="tgt-database" placeholder="new_db"></div>
+                <div class="mg-form-group"><label>User</label><input type="text" id="tgt-user" placeholder="validator_user"></div>
+                <div class="mg-form-group"><label>Password 环境变量</label><input type="text" id="tgt-password-env" placeholder="TARGET_DB_PASSWORD"></div>
+                <div class="mg-oracle-fields" style="display:none" data-db="tgt">
+                    <div class="mg-form-group"><label>Service Name</label><input type="text" id="tgt-service-name" placeholder="ORCL"></div>
+                    <div class="mg-form-group"><label>SID</label><input type="text" id="tgt-sid" placeholder="与 service_name 二选一"></div>
+                    <div class="mg-form-group">
+                        <label><input type="checkbox" id="tgt-thick-mode"> Thick 模式</label>
+                    </div>
+                    <div class="mg-form-group"><label>Oracle Client 路径</label><input type="text" id="tgt-oracle-client" placeholder="/opt/oracle/instantclient"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- 表映射列表 -->
+<section class="card mg-section">
+    <div class="card-header">
+        <h2>表映射</h2>
+        <button class="btn btn-primary btn-sm" onclick="MG.addTable()">+ 添加表</button>
+    </div>
+    <div id="tables-container">
+        <!-- 动态生成 -->
+    </div>
+</section>
+
+<!-- 全局设置 -->
+<section class="card mg-section">
+    <div class="card-header">
+        <h2>全局设置</h2>
+        <button class="btn btn-sm" onclick="MG.toggleSection('global-section')">折叠/展开</button>
+    </div>
+    <div id="global-section">
+        <div class="mg-settings-grid">
+            <div class="mg-form-group"><label>并行线程数</label><input type="number" id="gs-workers" value="4" min="1"></div>
+            <div class="mg-form-group"><label>超时时间（秒）</label><input type="number" id="gs-timeout" value="3600" min="0"></div>
+            <div class="mg-form-group"><label>输出目录</label><input type="text" id="gs-output-dir" value="./validation_reports"></div>
+            <div class="mg-form-group">
+                <label>报告格式</label>
+                <div class="mg-checkbox-group">
+                    <label><input type="checkbox" value="json" checked class="gs-format"> JSON</label>
+                    <label><input type="checkbox" value="html" checked class="gs-format"> HTML</label>
+                    <label><input type="checkbox" value="markdown" class="gs-format"> Markdown</label>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- 操作栏 -->
+<section class="card mg-section mg-actions-card">
+    <div class="mg-actions">
+        <button class="btn btn-primary" onclick="MG.generateJSON()">生成 JSON</button>
+        <button class="btn" onclick="MG.previewJSON()">预览</button>
+        <button class="btn" onclick="MG.downloadJSON()">下载 JSON</button>
+        <button class="btn" onclick="MG.loadFromJSON()">导入已有 JSON</button>
+        <input type="file" id="json-file" accept=".json" style="display:none">
+    </div>
+</section>
+
+<!-- JSON 预览 -->
+<section class="card mg-section" id="json-preview-section" style="display:none">
+    <div class="card-header">
+        <h2>JSON 预览</h2>
+        <div>
+            <button class="btn btn-sm" onclick="MG.copyJSON()">复制</button>
+            <button class="btn btn-sm" onclick="document.getElementById('json-preview-section').style.display='none'">关闭</button>
+        </div>
+    </div>
+    <pre id="json-preview" class="mg-json-preview"></pre>
+</section>
+
+<!-- 表映射模板（隐藏） -->
+<template id="tpl-table">
+    <div class="mg-table-card" data-table-idx="">
+        <div class="mg-table-header">
+            <div class="mg-table-title">
+                <span class="mg-table-badge">表</span>
+                <span class="mg-table-name">新表映射</span>
+            </div>
+            <div class="mg-table-actions">
+                <button class="btn btn-sm" onclick="MG.toggleTableBody(this)">折叠/展开</button>
+                <button class="btn btn-sm btn-danger" onclick="MG.removeTable(this)">删除</button>
+            </div>
+        </div>
+        <div class="mg-table-body">
+            <!-- 模式选择 -->
+            <div class="mg-form-row">
+                <div class="mg-form-group">
+                    <label>模式</label>
+                    <select class="tbl-mode" onchange="MG.onModeChange(this)">
+                        <option value="single">单表</option>
+                        <option value="multi">多表 JOIN</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- 单表模式 -->
+            <div class="mg-single-mode">
+                <div class="mg-form-row">
+                    <div class="mg-form-group"><label>源表名</label><input type="text" class="tbl-source-table" placeholder="users" oninput="MG.updateTableTitle(this)"></div>
+                    <div class="mg-form-group"><label>目标表名</label><input type="text" class="tbl-target-table" placeholder="user_profile" oninput="MG.updateTableTitle(this)"></div>
+                    <div class="mg-form-group"><label>源 Schema</label><input type="text" class="tbl-source-schema" placeholder="可选"></div>
+                    <div class="mg-form-group"><label>目标 Schema</label><input type="text" class="tbl-target-schema" placeholder="可选"></div>
+                </div>
+                <div class="mg-form-row">
+                    <div class="mg-form-group"><label>说明</label><input type="text" class="tbl-description" placeholder="可选"></div>
+                    <div class="mg-form-group"><label>源表过滤</label><input type="text" class="tbl-source-filter" placeholder="deleted_at IS NULL"></div>
+                    <div class="mg-form-group"><label>目标表过滤</label><input type="text" class="tbl-target-filter" placeholder="is_deleted = false"></div>
+                </div>
+                <div class="mg-form-row">
+                    <div class="mg-form-group"><label>抽样数量</label><input type="number" class="tbl-sample-size" value="0" min="0" title="0 表示全量"></div>
+                    <div class="mg-form-group"><label>批量大小</label><input type="number" class="tbl-batch-size" value="1000" min="1"></div>
+                </div>
+            </div>
+
+            <!-- 多表 JOIN 模式 -->
+            <div class="mg-multi-mode" style="display:none">
+                <div class="mg-form-row">
+                    <div class="mg-form-group"><label>目标表名</label><input type="text" class="tbl-target-table-multi" placeholder="order_detail" oninput="MG.updateTableTitle(this)"></div>
+                    <div class="mg-form-group"><label>目标 Schema</label><input type="text" class="tbl-target-schema-multi" placeholder="可选"></div>
+                    <div class="mg-form-group"><label>说明</label><input type="text" class="tbl-description-multi" placeholder="可选"></div>
+                </div>
+                <div class="mg-form-row">
+                    <div class="mg-form-group"><label>抽样数量</label><input type="number" class="tbl-sample-size-multi" value="0" min="0"></div>
+                    <div class="mg-form-group"><label>批量大小</label><input type="number" class="tbl-batch-size-multi" value="1000" min="1"></div>
+                </div>
+                <h4>JOIN 表配置 <button class="btn btn-sm" onclick="MG.addJoinTable(this)">+ 添加表</button></h4>
+                <div class="mg-join-tables">
+                    <!-- 动态生成 -->
+                </div>
+                <h4>表过滤条件</h4>
+                <div class="mg-table-filters">
+                    <div class="mg-form-row">
+                        <div class="mg-form-group" style="flex:1"><label>别名: 过滤条件（每行一个，格式 alias:条件）</label><textarea class="tbl-table-filters" rows="3" placeholder="o: o.deleted_at IS NULL&#10;u: u.status = 'active'"></textarea></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 字段映射 -->
+            <div class="mg-fields-section">
+                <div class="mg-fields-header">
+                    <h3>字段映射</h3>
+                    <button class="btn btn-sm btn-primary" onclick="MG.addField(this)">+ 添加字段</button>
+                </div>
+                <div class="mg-fields-table-wrap">
+                    <table class="mg-fields-table">
+                        <thead>
+                            <tr>
+                                <th>目标字段</th>
+                                <th>源字段</th>
+                                <th>主键</th>
+                                <th>转换类型</th>
+                                <th>转换字段</th>
+                                <th>转换参数</th>
+                                <th>比较规则</th>
+                                <th>容差</th>
+                                <th>可空</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody class="mg-fields-body">
+                            <!-- 动态生成 -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</template>
+
+<!-- 字段行模板 -->
+<template id="tpl-field-row">
+    <tr class="mg-field-row">
+        <td><input type="text" class="fd-target" placeholder="user_id"></td>
+        <td><input type="text" class="fd-source" placeholder="id 或 alias.field"></td>
+        <td><input type="checkbox" class="fd-pk"></td>
+        <td>
+            <select class="fd-transform-type" onchange="MG.onTransformChange(this)">
+                <option value="">无</option>
+                <option value="concat">concat</option>
+                <option value="upper">upper</option>
+                <option value="lower">lower</option>
+                <option value="trim">trim</option>
+                <option value="substring">substring</option>
+                <option value="replace">replace</option>
+                <option value="constant">constant</option>
+                <option value="coalesce">coalesce</option>
+                <option value="case">case</option>
+                <option value="date_format">date_format</option>
+                <option value="json_extract">json_extract</option>
+                <option value="cast">cast</option>
+                <option value="math">math</option>
+            </select>
+        </td>
+        <td><input type="text" class="fd-transform-fields" placeholder="field1|field2" title="多字段用 | 分隔"></td>
+        <td><input type="text" class="fd-transform-params" placeholder='{"separator":" "}' title="JSON 格式参数"></td>
+        <td>
+            <select class="fd-compare-rule">
+                <option value="exact">exact</option>
+                <option value="ignore_case">ignore_case</option>
+                <option value="ignore_whitespace">ignore_whitespace</option>
+                <option value="numeric_tolerance">numeric_tolerance</option>
+                <option value="skip">skip</option>
+            </select>
+        </td>
+        <td><input type="number" class="fd-tolerance" placeholder="0.01" step="any"></td>
+        <td><input type="checkbox" class="fd-nullable" checked></td>
+        <td>
+            <button class="btn btn-sm" onclick="MG.showFieldDetail(this)" title="更多设置">...</button>
+            <button class="btn btn-sm btn-danger" onclick="MG.removeField(this)">×</button>
+        </td>
+    </tr>
+</template>
+
+<!-- JOIN 表行模板 -->
+<template id="tpl-join-table">
+    <div class="mg-join-row mg-form-row">
+        <div class="mg-form-group"><label>表名</label><input type="text" class="jt-table-name" placeholder="orders"></div>
+        <div class="mg-form-group"><label>别名</label><input type="text" class="jt-alias" placeholder="o"></div>
+        <div class="mg-form-group"><label>Schema</label><input type="text" class="jt-schema" placeholder="可选"></div>
+        <div class="mg-form-group">
+            <label>JOIN 类型</label>
+            <select class="jt-join-type">
+                <option value="primary">primary（主表）</option>
+                <option value="inner">inner</option>
+                <option value="left">left</option>
+                <option value="right">right</option>
+                <option value="full">full</option>
+                <option value="cross">cross</option>
+            </select>
+        </div>
+        <div class="mg-form-group" style="flex:2"><label>JOIN 条件</label><input type="text" class="jt-join-condition" placeholder="o.user_id = u.id"></div>
+        <div class="mg-form-group" style="flex:0"><button class="btn btn-sm btn-danger" onclick="MG.removeJoinTable(this)">×</button></div>
+    </div>
+</template>
+
+<!-- 字段详细设置弹窗 -->
+<div id="field-detail-modal" class="mg-modal" style="display:none">
+    <div class="mg-modal-content">
+        <div class="mg-modal-header">
+            <h3>字段详细设置</h3>
+            <button class="btn btn-sm" onclick="MG.closeFieldDetail()">&times;</button>
+        </div>
+        <div class="mg-modal-body">
+            <div class="mg-form-group"><label>说明</label><input type="text" id="fdm-description" placeholder="字段说明"></div>
+            <h4>取值范围校验</h4>
+            <div class="mg-form-row">
+                <div class="mg-form-group"><label>最小值</label><input type="number" id="fdm-min-value" step="any"></div>
+                <div class="mg-form-group"><label>最大值</label><input type="number" id="fdm-max-value" step="any"></div>
+            </div>
+            <div class="mg-form-group"><label>允许值列表（| 分隔）</label><input type="text" id="fdm-allowed-values" placeholder="active|inactive|pending"></div>
+            <div class="mg-form-group"><label>正则表达式</label><input type="text" id="fdm-pattern" placeholder="^[a-zA-Z]+$"></div>
+            <div class="mg-form-group"><label>自定义校验表达式</label><input type="text" id="fdm-value-check-expr" placeholder="price > 0 AND price < 1000000"></div>
+        </div>
+        <div class="mg-modal-footer">
+            <button class="btn btn-primary" onclick="MG.saveFieldDetail()">保存</button>
+            <button class="btn" onclick="MG.closeFieldDetail()">取消</button>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="{{ url_for('static', filename='js/mapping_generator.js') }}"></script>
+{% endblock %}
