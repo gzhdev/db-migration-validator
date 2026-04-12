@@ -15,34 +15,30 @@ The tool validates data consistency between source and target tables after datab
 
 ## Running the Validator
 
+### Install dependencies (uv)
+```bash
+uv sync
+```
+
+All dependencies are declared in `pyproject.toml`. `uv sync` creates `.venv` automatically.
+
 ### Single-machine version
 ```bash
-# Basic run
-python validator.py mapping_example.json
-
-# Parallel execution
-python validator.py mapping_example.json --parallel
+uv run python validator.py mapping_example.json
+uv run python validator.py mapping_example.json --parallel
 ```
 
 ### Spark version
 ```bash
-# Local mode
-python validator_spark.py mapping_example.json
-
-# Specify Spark master
-python validator_spark.py mapping_example.json --master spark://localhost:7077
-
-# YARN mode
+uv run python validator_spark.py mapping_example.json
+uv run python validator_spark.py mapping_example.json --master spark://localhost:7077
 spark-submit validator_spark.py mapping_example.json --master yarn
 ```
 
-### Installing dependencies
+### Web server
 ```bash
-# Single-machine version
-pip install mysql-connector-python psycopg2-binary oracledb
-
-# Spark version
-pip install pyspark mysql-connector-python psycopg2-binary
+cd web && uv run python app.py
+# Serves at http://127.0.0.1:5000
 ```
 
 ## Architecture
@@ -121,13 +117,6 @@ pip install pyspark mysql-connector-python psycopg2-binary
 - This ensures NULL values pass validation when `nullable: true`, avoiding false positives
 - Reports display `NULL` (not `None`) for null values in error messages
 
-**Value Check Rules** (Spark version only, validates target field values):
-- `min_value` / `max_value` - Numeric range validation
-- `allowed_values` - Enum validation (list of allowed values)
-- `pattern` - Regex pattern validation
-- `value_check_expr` - Custom Spark SQL expression
-- `nullable` - If `true` (default), NULL values pass validation; if `false`, NULL values fail
-
 ### Spark Optimization (validator_spark.py)
 
 - **Predicate pushdown**: Uses subquery `(SELECT ... WHERE filter) AS subq` to push filters to database
@@ -145,6 +134,34 @@ pip install pyspark mysql-connector-python psycopg2-binary
 | Comparison logic | Python loops | Spark expressions + aggregation |
 | Parallelism | `ThreadPoolExecutor` | Spark distributed execution |
 | Join | In-memory dict indexing | DataFrame `full_outer` join |
+
+## Web Server Architecture (`web/`)
+
+Flask-based web application with two features:
+
+| Feature | Route | File |
+|---------|-------|------|
+| Debug log viewer | `GET /` | `templates/index.html` |
+| Mapping config generator | `GET /mapping-generator` | `templates/mapping_generator.html` |
+
+**Routes:**
+- `GET /` — List imported validation runs
+- `POST /import` — Import a debug directory
+- `GET /runs/<id>` — Run detail page
+- `GET /runs/<id>/records` — Record browser (AJAX)
+- `GET /mapping-generator` — Visual mapping config editor
+- `GET /api/csv-template` — Download CSV template for mapping generator
+- `GET /api/runs/<id>/records` — JSON API for records
+- `DELETE /runs/<id>` — Delete a run
+
+**Mapping Generator** (`web/static/js/mapping_generator.js`):
+- Visual editor for DB connections, table mappings, field mappings
+- CSV import: upload field mapping spreadsheet → auto-populate editor
+- Supports single-table and multi-table JOIN modes
+- JSON preview, download, and load-from-existing-JSON
+- All logic is client-side; no server round-trip needed to generate JSON
+
+**Database:** SQLite (`web/debug_viewer.db`, auto-created). Schema: `runs`, `table_summaries`, `records`.
 
 ## Configuration File Structure
 
@@ -205,6 +222,37 @@ pip install pyspark mysql-connector-python psycopg2-binary
   ]
 }
 ```
+
+### Conditional UNION Pattern (multi-source target table)
+
+When target table rows come from **different source tables depending on conditions**, split into multiple table mapping entries — each with mutually exclusive `source_filter` / `target_filter`. The validator runs each entry independently.
+
+```json
+{
+  "tables": [
+    {
+      "description": "条件1: 数据来自A表",
+      "source_table": "table_a",
+      "target_table": "target",
+      "filters": { "source_filter": "type = 'X'", "target_filter": "type = 'X'" },
+      "field_mappings": [...]
+    },
+    {
+      "description": "条件2: 数据来自A JOIN B",
+      "source_tables": [
+        { "table_name": "table_a", "alias": "a", "join_type": "primary" },
+        { "table_name": "table_b", "alias": "b", "join_type": "left", "join_condition": "a.id = b.ref_id" }
+      ],
+      "table_filters": { "a": "a.type != 'X' AND a.category = 'Y'" },
+      "target_table": "target",
+      "filters": { "target_filter": "type != 'X' AND category = 'Y'" },
+      "field_mappings": [...]
+    }
+  ]
+}
+```
+
+Alternatively, create a database view that encapsulates the UNION logic and use it as `source_table`.
 
 ## Important Implementation Notes
 
