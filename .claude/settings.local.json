@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(rtk git:*)",
+      "Bash(uv sync:*)",
+      "Bash(uv run:*)"
     ]
   }
 }

@@ -4,14 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a database migration data consistency validator tool with two implementations:
+This is a Spark-based database migration data consistency validator tool. It uses PySpark for distributed computing and validates data consistency between source and target tables after database migration, supporting flexible field mappings with transforms and multiple comparison rules.
 
-| Version | File | Use Case |
-|---------|------|----------|
-| Single-machine | `validator.py` | Small to medium data volumes, no cluster needed |
-| Spark distributed | `validator_spark.py` | Large datasets, distributed computing |
+### Package Structure
 
-The tool validates data consistency between source and target tables after database migration, supporting flexible field mappings with transforms and multiple comparison rules.
+| Module | Contents |
+|--------|----------|
+| `validator/__init__.py` | Spark conditional imports, logging setup |
+| `validator/models.py` | Data classes: SourceTable, FieldMapping, TableMapping, ValidationResult, DebugConfig, DebugRecord |
+| `validator/debug.py` | JsonlWriter, DebugExporter, `_fmt_value()` utility |
+| `validator/core.py` | SparkDataValidator main class |
+| `validator/__main__.py` | CLI entry point, `load_config()` |
 
 ## Running the Validator
 
@@ -22,17 +25,10 @@ uv sync
 
 All dependencies are declared in `pyproject.toml`. `uv sync` creates `.venv` automatically.
 
-### Single-machine version
+### Run validation
 ```bash
-uv run python validator.py mapping_example.json
-uv run python validator.py mapping_example.json --parallel
-```
-
-### Spark version
-```bash
-uv run python validator_spark.py mapping_example.json
-uv run python validator_spark.py mapping_example.json --master spark://localhost:7077
-spark-submit validator_spark.py mapping_example.json --master yarn
+uv run python -m validator mapping_example.json
+uv run python -m validator mapping_example.json --master spark://localhost:7077
 ```
 
 ### Web server
@@ -45,33 +41,22 @@ cd web && uv run python app.py
 
 ### Core Components
 
-**Data Classes** (Spark version):
+**Data Classes** (`validator/models.py`):
 - `SourceTable`: Defines a source table in multi-table JOIN (table_name, alias, join_type, join_condition)
 - `FieldMapping`: Defines how a target field maps from source (direct field or transform)
 - `TableMapping`: Contains source/target table info, field mappings, filters; supports single-table and multi-table modes
 - `ValidationResult`: Stores validation outcomes (matched, mismatched, missing counts)
 
-**Multi-Table JOIN Support** (Spark version only):
+**Multi-Table JOIN Support**:
 - `source_tables` array defines multiple source tables with aliases
 - `table_filters` defines per-table WHERE conditions
 - Field references use `alias.field` format (e.g., `o.id`, `u.name`)
 - `is_multi_source()` method on `TableMapping` determines mode
 
-**Database Connection Pattern** (validator.py):
-- Abstract `DatabaseConnection` class with concrete implementations for MySQL, PostgreSQL, SQLite, Oracle
-- `DatabaseConnectionFactory` creates appropriate connection based on config `type`
-- Supports `password_env` for secure password retrieval from environment variables
-
-**Oracle Specifics**:
-- Uses `python-oracledb` library (not `cx_Oracle`)
-- Thin mode is default (no Oracle Client required)
-- Thick mode available via `thick_mode: true` and `oracle_client` path
-- Supports both `service_name` and `sid` for DSN construction
-
 ### Validation Flow
 
 1. **Load config** - JSON mapping file with source_db, target_db, tables array
-2. **Connect databases** - Establish connections via JDBC (Spark) or drivers (single-machine)
+2. **Connect databases** - Establish JDBC connections via Spark
 3. **For each table mapping**:
    - Validate configuration (alias uniqueness, JOIN conditions, field references)
    - Build source query:
@@ -117,23 +102,13 @@ cd web && uv run python app.py
 - This ensures NULL values pass validation when `nullable: true`, avoiding false positives
 - Reports display `NULL` (not `None`) for null values in error messages
 
-### Spark Optimization (validator_spark.py)
+### Spark Optimization (`validator/core.py`)
 
 - **Predicate pushdown**: Uses subquery `(SELECT ... WHERE filter) AS subq` to push filters to database
 - **Parallel JDBC reads**: Partitions data using primary key ranges when `batch_size > 0`
 - **Single FULL JOIN**: Optimized validation uses one `full_outer` join with aggregation instead of multiple passes
 - **Caching**: Persists DataFrames before triggering actions
 - **Oracle AS syntax**: Oracle doesn't support `AS` alias, handled with conditional `alias_prefix`
-
-### Code Differences Between Versions
-
-| Aspect | validator.py | validator_spark.py |
-|--------|--------------|---------------------|
-| Data loading | `execute_query()` returns list of dicts | `spark.read.jdbc()` returns DataFrame |
-| Transform application | Python row-by-row | Spark SQL expressions (`col()`, `when()`, etc.) |
-| Comparison logic | Python loops | Spark expressions + aggregation |
-| Parallelism | `ThreadPoolExecutor` | Spark distributed execution |
-| Join | In-memory dict indexing | DataFrame `full_outer` join |
 
 ## Web Server Architecture (`web/`)
 
@@ -259,13 +234,11 @@ Alternatively, create a database view that encapsulates the UNION logic and use 
 - **Primary key handling**: If no `is_primary_key: true` fields are configured, all fields are used for joining
 - **Field mapping**: Fields with transforms are computed from source data before comparison
 - **Error sampling**: Only first 100 errors are stored in reports to prevent memory issues
-- **Oracle column names**: Oracle returns column names uppercase, converted to lowercase in `execute_query()`
 - **Report output**: Reports go to `./validation_reports/` by default (gitignored)
 - **Spark 4.x compatibility**: Row objects in Spark 4.x don't support `get()` method; use `row[field]` with `__fields__` check instead
 - **Column ambiguity**: After DataFrame join with alias, use `t.field_name` format to avoid ambiguity errors
 - **NULL display**: Reports show `NULL` (not `None`) for null field values
 - **Multi-table JOIN limitations**:
-  - Not supported in single-machine version (`validator.py`)
   - Partition reads disabled for multi-table mode (no parallel JDBC)
   - Column name conflicts resolved with `alias_field` format (e.g., `o_id`, `u_name`)
 - **Field alias resolution**:

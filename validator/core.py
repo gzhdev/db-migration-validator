@@ -1,597 +1,25 @@
-#!/usr/bin/env python3
-"""
-数据库迁移数据一致性校验工具 - Spark 版本
-Database Migration Data Consistency Validator - Spark Version
-
-使用 PySpark 进行分布式计算，支持大数据量的迁移校验。
-"""
+"""Spark 数据校验器核心逻辑"""
 
 import decimal
-import json
 import logging
 import os
-import sys
-from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
+import json
 
-# Spark Connect 模式：设置环境变量 SPARK_CONNECT_URL 启用（如 sc://localhost:15002）
-_SPARK_CONNECT_URL = os.environ.get("SPARK_CONNECT_URL", "").strip()
-
-if _SPARK_CONNECT_URL:
-    # Spark Connect 模式：必须使用 connect 专属的 functions 模块
-    # 经典 pyspark.sql.functions 内部检查 SparkContext._active_spark_context，
-    # 而 Spark Connect 无本地 SparkContext，调用 lit/when/col 等会抛 AssertionError
-    from pyspark.sql.connect.session import SparkSession
-    from pyspark.sql.connect.dataframe import DataFrame
-    from pyspark.sql.connect import functions as F
-    from pyspark.sql.connect.functions import col, when, lit, concat_ws, upper, lower, trim, substring, regexp_replace, coalesce, to_json, from_json, expr
-    from pyspark.sql.types import StringType, DoubleType, IntegerType, BooleanType
-else:
-    from pyspark.sql import SparkSession, DataFrame, functions as F
-    from pyspark.sql.types import StringType, DoubleType, IntegerType, BooleanType
-    from pyspark.sql.functions import col, when, lit, concat_ws, upper, lower, trim, substring, regexp_replace, coalesce, to_json, from_json, expr
-
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+from . import (
+    _SPARK_CONNECT_URL, SparkSession, DataFrame, F,
+    col, when, lit, concat_ws, upper, lower, trim, substring,
+    regexp_replace, coalesce, to_json, from_json, expr,
+    StringType, DoubleType, IntegerType, BooleanType,
 )
+from .models import (
+    SourceTable, FieldMapping, TableMapping, ValidationResult, DebugConfig,
+)
+from .debug import DebugExporter, _fmt_value
+
 logger = logging.getLogger(__name__)
-
-
-def _fmt_value(value: Any) -> str:
-    """将值转换为字符串，浮点数使用定点表示避免科学计数法"""
-    if value is None:
-        return 'NULL'
-    if isinstance(value, float):
-        return format(decimal.Decimal(repr(value)), 'f')
-    if isinstance(value, decimal.Decimal):
-        return format(value, 'f')
-    return str(value)
-
-
-@dataclass
-class SourceTable:
-    """多表 JOIN 中的源表配置"""
-    table_name: str
-    alias: str  # 表别名 (必需)
-    schema: Optional[str] = None
-    join_type: str = "inner"  # inner, left, right, full, cross, primary (仅第一个表使用)
-    join_condition: Optional[str] = None  # 除第一个表外必需
-
-
-@dataclass
-class FieldMapping:
-    """字段映射配置"""
-    target_field: str
-    source_field: Optional[str] = None
-    transform: Optional[Dict[str, Any]] = None
-    is_primary_key: bool = False
-    nullable: bool = True
-    compare_rule: str = "exact"
-    tolerance: Optional[float] = None
-    description: str = ""
-    # 取值范围校验配置
-    min_value: Optional[float] = None
-    max_value: Optional[float] = None
-    allowed_values: Optional[List[Any]] = None
-    pattern: Optional[str] = None  # 正则表达式
-    value_check_expr: Optional[str] = None  # 自定义 Spark SQL 表达式
-    # 多表 JOIN 支持
-    source_alias: Optional[str] = None  # 源表别名，用于多表 JOIN
-
-
-@dataclass
-class TableMapping:
-    """表映射配置"""
-    source_table: Optional[str] = None  # 单表模式 (向后兼容)
-    target_table: str = ""
-    field_mappings: List[FieldMapping] = field(default_factory=list)
-    source_schema: Optional[str] = None
-    target_schema: Optional[str] = None
-    description: str = ""
-    source_filter: Optional[str] = None  # 单表模式过滤条件 (向后兼容)
-    target_filter: Optional[str] = None
-    sample_size: int = 0
-    batch_size: int = 1000
-    # 多表 JOIN 支持
-    source_tables: List[SourceTable] = field(default_factory=list)
-    table_filters: Dict[str, str] = field(default_factory=dict)  # 各表过滤条件，key 为 alias
-
-    def is_multi_source(self) -> bool:
-        """判断是否为多表 JOIN 模式"""
-        return len(self.source_tables) > 0
-
-
-@dataclass
-class ValidationResult:
-    """校验结果"""
-    table_name: str
-    total_rows: int = 0
-    matched_rows: int = 0
-    mismatched_rows: int = 0
-    missing_in_source: int = 0
-    missing_in_target: int = 0
-    value_check_failed: int = 0  # 取值范围校验失败数
-    errors: List[Dict[str, Any]] = field(default_factory=list)
-    duration_seconds: float = 0.0
-    status: str = "pending"
-
-
-@dataclass
-class DebugConfig:
-    """Debug 配置"""
-    enabled: bool = False
-    output_dir: str = "./debug"
-    formats: List[str] = field(default_factory=lambda: ["jsonl"])
-    max_records: int = 10000
-    # record types
-    include_matched: bool = False
-    include_mismatched: bool = True
-    include_missing: bool = True
-    include_value_check_failed: bool = True
-    # data content
-    include_raw_source: bool = True
-    include_expected: bool = True
-    include_target: bool = True
-    buffer_size: int = 1000
-
-    @classmethod
-    def from_dict(cls, config: Dict[str, Any]) -> 'DebugConfig':
-        """从配置字典创建 DebugConfig"""
-        if not config:
-            return cls()
-
-        record_types = config.get('record_types', {})
-        data_content = config.get('data_content', {})
-
-        return cls(
-            enabled=config.get('enabled', False),
-            output_dir=config.get('output_dir', './debug'),
-            formats=config.get('formats', ['jsonl']),
-            max_records=config.get('max_records', 10000),
-            include_matched=record_types.get('matched', False),
-            include_mismatched=record_types.get('mismatched', True),
-            include_missing=record_types.get('missing_in_source', True) and record_types.get('missing_in_target', True),
-            include_value_check_failed=record_types.get('value_check_failed', True),
-            include_raw_source=data_content.get('include_raw_source', True),
-            include_expected=data_content.get('include_expected', True),
-            include_target=data_content.get('include_target', True),
-            buffer_size=config.get('buffer_size', 1000)
-        )
-
-
-@dataclass
-class DebugRecord:
-    """单条 debug 记录"""
-    record_id: str
-    primary_key: Dict[str, Any]
-    match_type: str  # matched, mismatched, missing_in_source, missing_in_target, value_check_failed
-    raw_source: Dict[str, Any] = field(default_factory=dict)
-    expected_values: Dict[str, Any] = field(default_factory=dict)
-    target_values: Dict[str, Any] = field(default_factory=dict)
-    comparison_result: Dict[str, Any] = field(default_factory=dict)
-    value_check_failures: List[Dict[str, Any]] = field(default_factory=list)
-
-    def to_dict(self) -> Dict[str, Any]:
-        """转换为字典"""
-        return {
-            'record_id': self.record_id,
-            'primary_key': self.primary_key,
-            'match_type': self.match_type,
-            'raw_source': self.raw_source,
-            'expected_values': self.expected_values,
-            'target_values': self.target_values,
-            'comparison_result': self.comparison_result,
-            'value_check_failures': self.value_check_failures
-        }
-
-
-class JsonlWriter:
-    """流式 JSONL 写入器"""
-
-    def __init__(self, output_path: str, buffer_size: int = 1000):
-        self.output_path = output_path
-        self.buffer_size = buffer_size
-        self._buffer: List[Dict[str, Any]] = []
-        self._file = None
-        self._record_count = 0
-
-    def open(self):
-        """打开文件"""
-        Path(self.output_path).parent.mkdir(parents=True, exist_ok=True)
-        self._file = open(self.output_path, 'w', encoding='utf-8')
-        self._buffer = []
-        self._record_count = 0
-
-    def write_record(self, record: Dict[str, Any]):
-        """写入单条记录 (带缓冲)"""
-        if not self._file:
-            self.open()
-
-        self._buffer.append(record)
-        self._record_count += 1
-
-        if len(self._buffer) >= self.buffer_size:
-            self.flush()
-
-    def flush(self):
-        """刷新缓冲区到文件"""
-        if self._file and self._buffer:
-            for record in self._buffer:
-                self._file.write(json.dumps(record, ensure_ascii=False, default=str) + '\n')
-            self._file.flush()
-            self._buffer = []
-
-    def close(self):
-        """关闭文件"""
-        self.flush()
-        if self._file:
-            self._file.close()
-            self._file = None
-        logger.info(f"JSONL 文件已保存: {self.output_path} ({self._record_count} 条记录)")
-
-    @property
-    def record_count(self) -> int:
-        return self._record_count
-
-
-
-
-class DebugExporter:
-    """主 Debug 导出器 - 协调 JSONL 输出"""
-
-    def __init__(self, config: DebugConfig):
-        self.config = config
-        self._jsonl_writer: Optional[JsonlWriter] = None
-        self._current_table: str = ""
-        self._record_counter: int = 0
-        self._table_counter: int = 0
-
-    def start(self):
-        """初始化导出器"""
-        if not self.config.enabled:
-            return
-
-        # 创建输出目录
-        Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
-
-        logger.info(f"Debug 导出器已启动, 输出目录: {self.config.output_dir}")
-
-    def start_table(self, table_name: str, mapping: 'TableMapping'):
-        """开始处理表"""
-        if not self.config.enabled:
-            return
-
-        self._current_table = table_name
-        self._table_counter += 1
-
-        # 创建表的 JSONL 写入器
-        if 'jsonl' in self.config.formats:
-            # 清理表名用于目录名
-            safe_name = table_name.replace(' -> ', '_to_').replace(' ', '_').replace('(', '').replace(')', '')
-            table_dir = Path(self.config.output_dir) / safe_name
-            jsonl_path = table_dir / "records.jsonl"
-            self._jsonl_writer = JsonlWriter(str(jsonl_path), self.config.buffer_size)
-            self._jsonl_writer.open()
-
-        logger.debug(f"开始 Debug 记录表: {table_name}")
-
-    def export_record(self, row: Any, mapping: 'TableMapping', field_alias_map: Dict[str, str],
-                     source_columns: List[str], value_check_fields: List['FieldMapping'] = None):
-        """
-        导出单条记录
-
-        Args:
-            row: Spark Row 对象
-            mapping: 表映射配置
-            field_alias_map: 字段别名映射
-            source_columns: 原始源表列名列表
-            value_check_fields: 需要取值范围校验的字段列表
-        """
-        if not self.config.enabled:
-            return
-
-        # 检查记录数限制
-        if self.config.max_records > 0 and self._record_counter >= self.config.max_records:
-            return
-
-        # 获取 Row 的字段列表 (Spark 4.x 兼容)
-        row_fields = row.__fields__ if hasattr(row, '__fields__') else []
-
-        # 获取匹配类型
-        match_type = self._get_row_value(row, '_match_type', row_fields)
-        if match_type is None:
-            return
-
-        # 确定有效的匹配类型：DataFrame 中字段不一致的行 _match_type 仍为 "matched"，
-        # 需结合 _all_fields_match 推导出真正的 "mismatched"
-        all_fields_match = self._get_row_value(row, '_all_fields_match', row_fields, default=True)
-        effective_match_type = 'mismatched' if (match_type == 'matched' and not all_fields_match) else match_type
-
-        # 检查是否需要记录该类型
-        if not self._should_record_type(effective_match_type):
-            return
-
-        # 生成记录 ID
-        self._record_counter += 1
-        record_id = f"{self._table_counter:03d}_{self._record_counter:06d}"
-
-        # 获取主键
-        primary_key = self._extract_primary_key(row, mapping, row_fields, match_type)
-
-        # 提取原始源数据
-        raw_source = {}
-        if self.config.include_raw_source and match_type != 'missing_in_source':
-            raw_source = self._extract_raw_source(row, source_columns, row_fields, field_alias_map)
-            logger.debug(f"extracted raw_source: {raw_source}")
-
-        # 提取期望值
-        expected_values = {}
-        if self.config.include_expected and match_type not in ('missing_in_source', 'missing_in_target'):
-            expected_values = self._extract_expected_values(row, mapping, row_fields)
-            logger.debug(f"extracted expected_values: {expected_values}")
-
-        # 提取目标值
-        target_values = {}
-        if self.config.include_target and match_type != 'missing_in_target':
-            target_values = self._extract_target_values(row, mapping, row_fields)
-            logger.debug(f"extracted target_values: {target_values}")
-
-        # 提取比对结果
-        comparison_result = {}
-        if effective_match_type == 'mismatched':
-            comparison_result = self._extract_comparison_result(row, mapping, row_fields)
-
-        # 提取取值范围校验失败
-        value_check_failures = []
-        if value_check_fields and match_type != 'missing_in_target':
-            if not self._get_row_value(row, '_value_check_passed', row_fields, default=True):
-                value_check_failures = self._extract_value_check_failures(row, value_check_fields, row_fields)
-
-        # 创建记录
-        record = DebugRecord(
-            record_id=record_id,
-            primary_key=primary_key,
-            match_type=effective_match_type,
-            raw_source=raw_source,
-            expected_values=expected_values,
-            target_values=target_values,
-            comparison_result=comparison_result,
-            value_check_failures=value_check_failures
-        )
-
-        # 写入 JSONL
-        if self._jsonl_writer:
-            self._jsonl_writer.write_record(record.to_dict())
-
-    def end_table(self, stats: Dict[str, int]):
-        """结束表处理"""
-        if not self.config.enabled:
-            return
-
-        # 关闭 JSONL 写入器
-        if self._jsonl_writer:
-            self._jsonl_writer.close()
-            self._jsonl_writer = None
-
-            # 写入 summary.json
-            safe_name = self._current_table.replace(' -> ', '_to_').replace(' ', '_').replace('(', '').replace(')', '')
-            summary_path = Path(self.config.output_dir) / safe_name / "summary.json"
-            with open(summary_path, 'w', encoding='utf-8') as f:
-                json.dump(stats, f, ensure_ascii=False, indent=2)
-
-        logger.debug(f"完成 Debug 记录表: {self._current_table}")
-
-    def close(self):
-        """关闭导出器"""
-        if not self.config.enabled:
-            return
-
-        logger.info(f"Debug 导出完成, 共 {self._record_counter} 条记录")
-
-    def _should_record_type(self, match_type: str) -> bool:
-        """检查是否应该记录该类型"""
-        type_mapping = {
-            'matched': self.config.include_matched,
-            'mismatched': self.config.include_mismatched,
-            'missing_in_source': self.config.include_missing,
-            'missing_in_target': self.config.include_missing,
-            'value_check_failed': self.config.include_value_check_failed
-        }
-        return type_mapping.get(match_type, False)
-
-    def _get_row_value(self, row: Any, field: str, row_fields: List[str], default: Any = None) -> Any:
-        """安全获取 Row 字段值 (Spark 4.x 兼容)"""
-        # 尝试带表别名
-        if f"s.{field}" in row_fields:
-            return row[f"s.{field}"]
-        if f"t.{field}" in row_fields:
-            return row[f"t.{field}"]
-        if field in row_fields:
-            return row[field]
-        return default
-
-    def _extract_primary_key(self, row: Any, mapping: 'TableMapping', row_fields: List[str], match_type: str) -> Dict[str, Any]:
-        """提取主键"""
-        pk_fields = [fm.target_field for fm in mapping.field_mappings if fm.is_primary_key]
-        if not pk_fields:
-            pk_fields = [fm.target_field for fm in mapping.field_mappings]
-
-        pk_dict = {}
-        # 优先尝试带 s. 前缀
-        source_pk = self._get_row_value(row, 's._source_pk', row_fields)
-        if source_pk is None:
-            source_pk = self._get_row_value(row, '_source_pk', row_fields)
-        # 优先尝试带 t. 前缀
-        target_pk = self._get_row_value(row, 't._target_pk', row_fields)
-        if target_pk is None:
-            target_pk = self._get_row_value(row, '_target_pk', row_fields)
-
-        if match_type == 'missing_in_target' and source_pk is not None:
-            # 从 source_pk 结构中提取
-            if hasattr(source_pk, '__fields__'):
-                for f in source_pk.__fields__:
-                    pk_dict[f] = _fmt_value(source_pk[f])
-            elif isinstance(source_pk, dict):
-                pk_dict = {k: _fmt_value(v) for k, v in source_pk.items()}
-            else:
-                pk_dict['pk'] = _fmt_value(source_pk)
-        elif match_type == 'missing_in_source' and target_pk is not None:
-            if hasattr(target_pk, '__fields__'):
-                for f in target_pk.__fields__:
-                    pk_dict[f] = _fmt_value(target_pk[f])
-            elif isinstance(target_pk, dict):
-                pk_dict = {k: _fmt_value(v) for k, v in target_pk.items()}
-            else:
-                pk_dict['pk'] = _fmt_value(target_pk)
-        else:
-            # 从各字段提取，以字段存在性判断
-            for pk_field in pk_fields:
-                s_exp_col = f"s._expected_{pk_field}"
-                exp_col = f"_expected_{pk_field}"
-                if s_exp_col in row_fields:
-                    pk_dict[pk_field] = _fmt_value(row[s_exp_col])
-                elif exp_col in row_fields:
-                    pk_dict[pk_field] = _fmt_value(row[exp_col])
-                elif pk_field in row_fields:
-                    pk_dict[pk_field] = _fmt_value(row[pk_field])
-
-        return pk_dict if pk_dict else {'pk': 'unknown'}
-
-    def _extract_raw_source(self, row: Any, source_columns: List[str], row_fields: List[str],
-                            field_alias_map: Dict[str, str] = None) -> Dict[str, Any]:
-        """提取原始源数据，多表模式下 key 还原为 alias.field 格式"""
-        # 构建反向映射: alias_field -> alias.field (仅多表模式下有实际映射)
-        reverse_alias_map = {}
-        if field_alias_map:
-            for dotted, col_name in field_alias_map.items():
-                if '.' in dotted:  # 只处理多表别名字段
-                    reverse_alias_map[col_name] = dotted
-
-        raw_source = {}
-        for col_name in source_columns:
-            # 尝试不同的列名格式 (join 后列名带 s. 前缀)，以字段存在性判断而非值是否为 None
-            col_with_prefix = f"s.{col_name}"
-            if col_with_prefix in row_fields:
-                value = _fmt_value(row[col_with_prefix])
-            elif col_name in row_fields:
-                value = _fmt_value(row[col_name])
-            else:
-                continue
-            # 多表模式: 还原 key 为 alias.field 格式
-            display_key = reverse_alias_map.get(col_name, col_name)
-            raw_source[display_key] = value
-
-        return raw_source
-
-    def _extract_expected_values(self, row: Any, mapping: 'TableMapping', row_fields: List[str]) -> Dict[str, Any]:
-        """提取期望值"""
-        expected = {}
-        for fm in mapping.field_mappings:
-            expected_col = f"_expected_{fm.target_field}"
-            s_expected_col = f"s.{expected_col}"
-            # 以字段存在性判断，优先带 s. 前缀（join 后列名格式）
-            if s_expected_col in row_fields:
-                expected[fm.target_field] = _fmt_value(row[s_expected_col])
-            elif expected_col in row_fields:
-                expected[fm.target_field] = _fmt_value(row[expected_col])
-        return expected
-
-    def _extract_target_values(self, row: Any, mapping: 'TableMapping', row_fields: List[str]) -> Dict[str, Any]:
-        """提取目标值"""
-        target = {}
-        for fm in mapping.field_mappings:
-            # 优先使用 _target_* 专用列（join 前预先添加，名称唯一，不受 alias/同名列影响）
-            dedicated_col = f"_target_{fm.target_field}"
-            t_col = f"t.{fm.target_field}"
-            if dedicated_col in row_fields:
-                target[fm.target_field] = _fmt_value(row[dedicated_col])
-            elif t_col in row_fields:
-                target[fm.target_field] = _fmt_value(row[t_col])
-            elif fm.target_field in row_fields:
-                target[fm.target_field] = _fmt_value(row[fm.target_field])
-        return target
-
-    def _extract_comparison_result(self, row: Any, mapping: 'TableMapping', row_fields: List[str]) -> Dict[str, Any]:
-        """提取比对结果"""
-        result = {}
-        for fm in mapping.field_mappings:
-            cmp_col = f"_cmp_{fm.target_field}"
-            is_match = self._get_row_value(row, cmp_col, row_fields)
-            if is_match is False:  # 明确不匹配
-                # 以字段存在性判断，避免将 NULL 值误判为字段缺失而继续 fallback
-                s_exp_col = f"s._expected_{fm.target_field}"
-                exp_col = f"_expected_{fm.target_field}"
-                if s_exp_col in row_fields:
-                    expected_val = row[s_exp_col]
-                elif exp_col in row_fields:
-                    expected_val = row[exp_col]
-                else:
-                    expected_val = None
-
-                dedicated_col = f"_target_{fm.target_field}"
-                t_col = f"t.{fm.target_field}"
-                if dedicated_col in row_fields:
-                    actual_val = row[dedicated_col]
-                elif t_col in row_fields:
-                    actual_val = row[t_col]
-                elif fm.target_field in row_fields:
-                    actual_val = row[fm.target_field]
-                else:
-                    actual_val = None
-
-                result[fm.target_field] = {
-                    'match': False,
-                    'expected': _fmt_value(expected_val),
-                    'actual': _fmt_value(actual_val)
-                }
-        return result
-
-    def _extract_value_check_failures(self, row: Any, value_check_fields: List['FieldMapping'], row_fields: List[str]) -> List[Dict[str, Any]]:
-        """提取取值范围校验失败"""
-        failures = []
-        for fm in value_check_fields:
-            check_col = f"_value_check_{fm.target_field}"
-            is_passed = self._get_row_value(row, check_col, row_fields)
-            if is_passed is False:
-                # 优先使用 _target_* 专用列，避免同名列或 alias 格式不一致
-                dedicated_col = f"_target_{fm.target_field}"
-                t_col = f"t.{fm.target_field}"
-                if dedicated_col in row_fields:
-                    field_value = row[dedicated_col]
-                elif t_col in row_fields:
-                    field_value = row[t_col]
-                elif fm.target_field in row_fields:
-                    field_value = row[fm.target_field]
-                else:
-                    field_value = None
-
-                # 构建失败原因
-                reasons = []
-                if field_value is None:
-                    if not fm.nullable:
-                        reasons.append("字段不允许为空")
-                else:
-                    if fm.min_value is not None and field_value < fm.min_value:
-                        reasons.append(f"小于最小值 {fm.min_value}")
-                    if fm.max_value is not None and field_value > fm.max_value:
-                        reasons.append(f"大于最大值 {fm.max_value}")
-                    if fm.allowed_values and field_value not in fm.allowed_values:
-                        reasons.append(f"不在允许值列表中")
-                    if fm.pattern:
-                        reasons.append(f"不匹配正则 {fm.pattern}")
-                    if fm.value_check_expr:
-                        reasons.append(f"不满足条件 {fm.value_check_expr}")
-
-                failures.append({
-                    'field': fm.target_field,
-                    'value': _fmt_value(field_value),
-                    'reasons': reasons
-                })
-        return failures
 
 
 class SparkDataValidator:
@@ -612,7 +40,7 @@ class SparkDataValidator:
         debug_config = mapping_config.get('global_settings', {}).get('debug', {})
         self.debug_config = DebugConfig.from_dict(debug_config)
         self.debug_exporter = DebugExporter(self.debug_config)
-    
+
     def _create_spark_session(self) -> SparkSession:
         """创建 Spark Session（支持 Spark Connect 模式）"""
         if _SPARK_CONNECT_URL:
@@ -629,27 +57,27 @@ class SparkDataValidator:
         # .config("spark.driver.memory", "2g") \
 
         return builder.getOrCreate()
-    
+
     def _get_jdbc_url(self, db_config: Dict[str, Any]) -> str:
         """生成 JDBC URL"""
         db_type = db_config.get('type', 'mysql').lower()
         host = db_config['host']
         port = db_config.get('port')
         database = db_config.get('database', '')
-        
+
         if db_type == 'mysql':
             port = port or 3306
             return f"jdbc:mysql://{host}:{port}/{database}?useSSL=false&serverTimezone=UTC"
-        
+
         elif db_type == 'postgresql':
             port = port or 5432
             return f"jdbc:postgresql://{host}:{port}/{database}"
-        
+
         elif db_type == 'oracle':
             port = port or 1521
             service_name = db_config.get('service_name')
             sid = db_config.get('sid')
-            
+
             if service_name:
                 # 使用 service_name 格式
                 return f"jdbc:oracle:thin:@//{host}:{port}/{service_name}"
@@ -662,25 +90,25 @@ class SparkDataValidator:
                     return f"jdbc:oracle:thin:@//{host}:{port}/{database}"
                 else:
                     return f"jdbc:oracle:thin:@{host}:{port}"
-        
+
         elif db_type == 'sqlserver':
             port = port or 1433
             return f"jdbc:sqlserver://{host}:{port};databaseName={database}"
-        
+
         else:
             raise ValueError(f"不支持的数据库类型: {db_type}")
-    
+
     def _get_jdbc_properties(self, db_config: Dict[str, Any]) -> Dict[str, str]:
         """生成 JDBC 连接属性"""
         password = db_config.get('password')
         if not password and db_config.get('password_env'):
             password = os.environ.get(db_config['password_env'])
-        
+
         props = {
             'user': db_config.get('user', ''),
             'password': password or '',
         }
-        
+
         # MySQL 驱动
         db_type = db_config.get('type', 'mysql').lower()
         drivers = {
@@ -689,12 +117,12 @@ class SparkDataValidator:
             'oracle': 'oracle.jdbc.driver.OracleDriver',
             'sqlserver': 'com.microsoft.sqlserver.jdbc.SQLServerDriver',
         }
-        
+
         if db_type in drivers:
             props['driver'] = drivers[db_type]
-        
+
         return props
-    
+
     def _get_full_table_name(self, table: str, schema: str = None, db_type: str = 'mysql') -> str:
         """获取完整表名"""
         if schema:
@@ -871,7 +299,7 @@ class SparkDataValidator:
 
         # 过滤掉空别名的情况 (单表模式)
         return [(a, f) for a, f in fields_with_alias if a]
-    
+
     def load_table_mapping(self, table_config: Dict[str, Any]) -> TableMapping:
         """加载表映射配置 (支持单表和多表 JOIN 模式)"""
         field_mappings = self._parse_field_mappings(table_config.get('field_mappings', []))
@@ -985,7 +413,7 @@ class SparkDataValidator:
                 errors.append("单表模式需要配置 source_table")
 
         return errors
-    
+
     def read_source_table(self, mapping: TableMapping) -> Tuple[DataFrame, Dict[str, str]]:
         """
         读取源表数据 (优化: 谓词下推 + 并行读取)
@@ -1047,40 +475,40 @@ class SparkDataValidator:
             df = df.sample(withReplacement=False, fraction=1.0).limit(mapping.sample_size)
 
         return df, field_alias_map
-    
+
     def read_target_table(self, mapping: TableMapping) -> DataFrame:
         """读取目标表数据 (优化: 谓词下推 + 并行读取)"""
         jdbc_url = self._get_jdbc_url(self.config['target_db'])
         props = self._get_jdbc_properties(self.config['target_db'])
-        
+
         # 收集目标字段
         target_fields = [fm.target_field for fm in mapping.field_mappings]
-        
+
         # 构建查询
         table = self._get_full_table_name(
             mapping.target_table,
             mapping.target_schema,
             self.config['target_db'].get('type', 'mysql')
         )
-        
+
         db_type = self.config['target_db'].get('type', 'mysql').lower()
-        
+
         # Oracle 不支持 AS 别名语法，需要直接使用别名
         alias_prefix = "" if db_type == 'oracle' else "AS "
-        
+
         # 构建带过滤条件的子查询 (谓词下推)
         if mapping.target_filter:
             query = f"(SELECT {', '.join(target_fields)} FROM {table} WHERE {mapping.target_filter}) {alias_prefix}subq"
         else:
             query = f"(SELECT {', '.join(target_fields)} FROM {table}) {alias_prefix}subq"
-        
+
         # JDBC 并行读取配置
         options = {
             'url': jdbc_url,
             'dbtable': query,
             **props
         }
-        
+
         # 如果配置了分区列，启用并行读取
         pk_fields = [fm.target_field for fm in mapping.field_mappings if fm.is_primary_key]
         if pk_fields and mapping.batch_size > 0:
@@ -1099,10 +527,10 @@ class SparkDataValidator:
                     logger.debug(f"主键 {pk_fields[0]} 为非数值类型 ({type(bounds[0]).__name__})，跳过分区读取")
             except Exception as e:
                 logger.warning(f"无法获取分区边界，使用默认读取: {e}", exc_info=True)
-        
+
         df = self.spark.read.format("jdbc").options(**options).load()
         return df
-    
+
     def apply_transform(self, df: DataFrame, transform: Dict[str, Any],
                         field_alias_map: Dict[str, str] = None) -> DataFrame:
         """
@@ -1287,12 +715,6 @@ class SparkDataValidator:
             # 保存包含期望值的列名 (用于 debug 导出)
             source_columns = source_with_expected.columns
 
-            # 构建源 DataFrame（包含期望值）
-            source_with_expected = self.build_source_df(source_df, mapping, field_alias_map)
-
-            # 保存包含期望值的列名 (用于 debug 导出)
-            source_columns = source_with_expected.columns
-
             # 获取主键字段
             pk_fields = [fm.target_field for fm in mapping.field_mappings if fm.is_primary_key]
             if not pk_fields:
@@ -1302,7 +724,7 @@ class SparkDataValidator:
             # 构建主键列 - 使用 struct 更安全 (避免分隔符冲突)
             source_pk_cols = [col(f"_expected_{f}") for f in pk_fields]
             target_pk_cols = [col(f) for f in pk_fields]
-            
+
             source_with_expected = source_with_expected.withColumn("_source_pk", F.struct(*source_pk_cols))
             target_df = target_df.withColumn("_target_pk", F.struct(*target_pk_cols))
 
@@ -1311,7 +733,7 @@ class SparkDataValidator:
             # 同名列 fallback 会取到 source 侧的值（或 Spark Connect 下字段名含 ExprId 导致空值）
             for _fm in mapping.field_mappings:
                 target_df = target_df.withColumn(f"_target_{_fm.target_field}", col(_fm.target_field))
-            
+
             # 缓存数据（Spark Connect 旧版本可能不支持 persist，容错处理）
             _persisted = []
             try:
@@ -1325,14 +747,14 @@ class SparkDataValidator:
             source_count = source_with_expected.count()
             result.total_rows = source_count
             logger.info(f"源表记录数: {source_count}")
-            
+
             # ========== 优化: 单次 FULL OUTER JOIN 完成所有比较 ==========
             joined_df = source_with_expected.alias("s").join(
                 target_df.alias("t"),
                 col("s._source_pk") == col("t._target_pk"),
                 "full_outer"
             )
-            
+
             # 添加分类标记
             classified_df = joined_df.withColumn(
                 "_match_type",
@@ -1340,13 +762,13 @@ class SparkDataValidator:
                 .when(col("t._target_pk").isNull(), "missing_in_target")
                 .otherwise("matched")
             )
-            
+
             # 对匹配记录添加字段比较结果
             for fm in mapping.field_mappings:
                 expected_col = f"s._expected_{fm.target_field}"
                 actual_col = f"t.{fm.target_field}"
                 result_col = f"_cmp_{fm.target_field}"
-                
+
                 if fm.compare_rule == 'skip':
                     classified_df = classified_df.withColumn(result_col, lit(True))
                 elif fm.compare_rule == 'exact':
@@ -1377,7 +799,7 @@ class SparkDataValidator:
                         result_col,
                         col(expected_col).eqNullSafe(col(actual_col))
                     )
-            
+
             # 计算所有字段是否匹配
             cmp_cols = [col(f"_cmp_{fm.target_field}") for fm in mapping.field_mappings]
             all_match_expr = cmp_cols[0]
@@ -1457,7 +879,7 @@ class SparkDataValidator:
                     logger.info(f"取值范围校验失败: {result.value_check_failed}")
             else:
                 classified_df = classified_df.withColumn("_value_check_passed", lit(True))
-            
+
             # ========== 优化: 单次聚合计算所有统计值 ==========
             stats = classified_df.agg(
                 F.sum(when(col("_match_type") == "missing_in_source", 1).otherwise(0)).alias("missing_in_source"),
@@ -1465,12 +887,12 @@ class SparkDataValidator:
                 F.sum(when((col("_match_type") == "matched") & col("_all_fields_match"), 1).otherwise(0)).alias("fully_matched"),
                 F.sum(when((col("_match_type") == "matched") & ~col("_all_fields_match"), 1).otherwise(0)).alias("mismatched")
             ).first()
-            
+
             result.missing_in_source = stats["missing_in_source"] or 0
             result.missing_in_target = stats["missing_in_target"] or 0
             result.matched_rows = stats["fully_matched"] or 0
             result.mismatched_rows = stats["mismatched"] or 0
-            
+
             logger.info(f"匹配: {result.matched_rows}, 不匹配: {result.mismatched_rows}, "
                        f"源缺失: {result.missing_in_source}, 目标缺失: {result.missing_in_target}")
 
@@ -1671,10 +1093,10 @@ class SparkDataValidator:
                     _df.unpersist()
                 except Exception:
                     pass
-        
+
         result.duration_seconds = (datetime.now() - start_time).total_seconds()
         return result
-    
+
     def run_validation(self) -> List[ValidationResult]:
         """运行全部校验"""
         # 启动 debug 导出
@@ -1714,19 +1136,19 @@ class SparkDataValidator:
         self.debug_exporter.close()
 
         return self.results
-    
+
     def generate_report(self, output_dir: str = None, formats: List[str] = None):
         """生成报告"""
         if not output_dir:
             output_dir = self.config.get('global_settings', {}).get('output_dir', './reports')
         if not formats:
             formats = self.config.get('global_settings', {}).get('report_format', ['json'])
-        
+
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
-        
+
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
+
         if 'json' in formats:
             report = {
                 'generated_at': datetime.now().isoformat(),
@@ -1756,12 +1178,12 @@ class SparkDataValidator:
                     for r in self.results
                 ]
             }
-            
+
             report_file = output_path / f'validation_report_{timestamp}.json'
             with open(report_file, 'w', encoding='utf-8') as f:
                 json.dump(report, f, ensure_ascii=False, indent=2)
             logger.info(f"JSON 报告已生成: {report_file}")
-        
+
         if 'markdown' in formats:
             report_file = output_path / f'validation_report_{timestamp}.md'
             with open(report_file, 'w', encoding='utf-8') as f:
@@ -1829,76 +1251,8 @@ class SparkDataValidator:
                             f.write(", ".join(f"`{k}`" for k in keys) + "\n\n")
 
             logger.info(f"Markdown 报告已生成: {report_file}")
-    
+
     def stop(self):
         """停止 Spark Session（Spark Connect 模式下不停止远程服务）"""
         if self.spark and not _SPARK_CONNECT_URL:
             self.spark.stop()
-
-
-def load_config(config_path: str) -> Dict[str, Any]:
-    """加载配置文件"""
-    with open(config_path, 'r', encoding='utf-8') as f:
-        return json.load(f)
-
-
-def main():
-    if len(sys.argv) < 2:
-        print("用法: python validator_spark.py <config.json> [--master <spark-master>]")
-        print("示例: python validator_spark.py mapping_example.json --master spark://localhost:7077")
-        sys.exit(1)
-    
-    config_path = sys.argv[1]
-    master = None
-    
-    if '--master' in sys.argv:
-        master_idx = sys.argv.index('--master')
-        if master_idx + 1 < len(sys.argv):
-            master = sys.argv[master_idx + 1]
-    
-    # 加载配置
-    config = load_config(config_path)
-    
-    # 创建 Spark 会话（Spark Connect 优先）
-    if _SPARK_CONNECT_URL:
-        logger.info(f"使用 Spark Connect 模式: {_SPARK_CONNECT_URL}")
-        if master:
-            logger.warning("--master 参数在 Spark Connect 模式下被忽略，请通过 SPARK_CONNECT_URL 指定连接地址")
-        spark = SparkSession.builder.remote(_SPARK_CONNECT_URL).getOrCreate()
-    else:
-        spark_builder = SparkSession.builder.appName("DB-Migration-Validator")
-        if master:
-            spark_builder = spark_builder.master(master)
-        spark = spark_builder.getOrCreate()
-    
-    # 创建校验器
-    validator = SparkDataValidator(config, spark)
-    
-    try:
-        # 运行校验
-        logger.info("开始数据一致性校验 (Spark)...")
-        validator.run_validation()
-        
-        # 生成报告
-        validator.generate_report()
-        
-        # 打印摘要
-        print("\n=== 校验摘要 ===")
-        for result in validator.results:
-            print(f"{result.table_name}: {result.status}")
-            print(f"  匹配: {result.matched_rows}/{result.total_rows}")
-            if result.mismatched_rows > 0:
-                print(f"  不匹配: {result.mismatched_rows}")
-            if result.missing_in_source > 0:
-                print(f"  源表缺失: {result.missing_in_source}")
-            if result.missing_in_target > 0:
-                print(f"  目标表缺失: {result.missing_in_target}")
-        
-        print("\n校验完成！")
-        
-    finally:
-        validator.stop()
-
-
-if __name__ == '__main__':
-    main()

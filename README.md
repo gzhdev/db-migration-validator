@@ -4,10 +4,14 @@
 
 ## 版本
 
-| 版本 | 文件 | 适用场景 |
-|------|------|----------|
-| 单机版 | `validator.py` | 中小数据量，无需集群 |
-| Spark版 | `validator_spark.py` | 大数据量，分布式计算 |
+基于 PySpark 的分布式数据校验工具，适用于大数据量场景。
+
+| 模块 | 说明 |
+|------|------|
+| `validator/models.py` | 数据模型定义 |
+| `validator/debug.py` | Debug 导出功能 |
+| `validator/core.py` | 核心校验逻辑 |
+| `validator/__main__.py` | CLI 入口 |
 
 ## 功能特性
 
@@ -16,9 +20,9 @@
 - **条件分段来源**: 目标表数据来自不同条件下的不同源表时，拆分为多个映射条目分别校验
 - **多种比较规则**: 精确比较、忽略大小写、忽略空白、数值容差、跳过比较
 - **取值范围校验**: 支持最小/最大值、允许值列表、正则表达式、自定义表达式校验
-- **多数据库支持**: MySQL、PostgreSQL、Oracle、SQLite
+- **多数据库支持**: 通过 JDBC 连接 MySQL、PostgreSQL、Oracle、SQL Server
 - **丰富的转换函数**: 字符串拼接、大小写转换、日期格式化、JSON 提取等
-- **并行校验**: 单机版支持多线程，Spark版支持分布式计算
+- **并行校验**: Spark 分布式计算
 - **详细报告**: JSON、Markdown、HTML 多种格式报告，包含错误样本和差异详情
 - **可视化配置生成器**: Web 界面可视化编辑并生成配置文件，支持 CSV 批量导入
 
@@ -37,24 +41,12 @@ uv sync
 
 ## 快速开始
 
-### 单机版
-
-```bash
-uv run python validator.py mapping_example.json
-uv run python validator.py mapping_example.json --parallel
-```
-
-### Spark版
-
 ```bash
 # 本地模式
-uv run python validator_spark.py mapping_example.json
+uv run python -m validator mapping_example.json
 
 # 指定 Spark Master
-uv run python validator_spark.py mapping_example.json --master spark://localhost:7077
-
-# YARN 模式
-spark-submit validator_spark.py mapping_example.json --master yarn
+uv run python -m validator mapping_example.json --master spark://localhost:7077
 ```
 
 ### Web 服务器（配置生成器 + Debug 日志查看器）
