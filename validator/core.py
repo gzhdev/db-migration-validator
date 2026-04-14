@@ -607,7 +607,19 @@ class SparkDataValidator:
                 then_val = lit(c['then'])
                 if 'when_expr' in c:
                     # 复合条件: {"when_expr": "A = 0 AND B = 1", "then": "0"}
-                    cond = expr(c['when_expr'])
+                    # 替换字段引用为实际列名 (e.g. o.sa_dw_rang -> `O_SA_DW_RANG`)
+                    when_expr_str = c['when_expr']
+                    handled_keys = set()
+                    for orig_field, actual_col in actual_fields:
+                        when_expr_str = when_expr_str.replace(orig_field, f"`{actual_col}`")
+                        handled_keys.add(orig_field)
+                    # 若 when_expr 中引用了 fields 之外的多表字段，也做 field_alias_map 替换
+                    for alias_field, actual_col in field_alias_map.items():
+                        if alias_field in handled_keys or alias_field == actual_col:
+                            continue
+                        if alias_field in when_expr_str:
+                            when_expr_str = when_expr_str.replace(alias_field, f"`{actual_col}`")
+                    cond = expr(when_expr_str)
                 elif actual_fields:
                     # 单字段等值: {"when": "active", "then": "1"}
                     cond = col(actual_fields[0][1]) == c['when']
