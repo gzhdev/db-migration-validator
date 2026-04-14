@@ -16,7 +16,7 @@
 ## 功能特性
 
 - **灵活的字段映射**: 支持直接映射、字段转换、条件映射等多种方式
-- **多表 JOIN 支持**: Spark版支持多张源表 JOIN 后与目标表比对
+- **多表 JOIN 支持**: 支持多张源表 JOIN 后与目标表比对
 - **条件分段来源**: 目标表数据来自不同条件下的不同源表时，拆分为多个映射条目分别校验
 - **多种比较规则**: 精确比较、忽略大小写、忽略空白、数值容差、跳过比较
 - **取值范围校验**: 支持最小/最大值、允许值列表、正则表达式、自定义表达式校验
@@ -24,13 +24,13 @@
 - **丰富的转换函数**: 字符串拼接、大小写转换、日期格式化、JSON 提取等
 - **并行校验**: Spark 分布式计算
 - **详细报告**: JSON、Markdown、HTML 多种格式报告，包含错误样本和差异详情
-- **可视化配置生成器**: Web 界面可视化编辑并生成配置文件，支持 CSV 批量导入
+- **可视化配置生成器**: Web 界面可视化编辑并生成配置文件，支持 Excel 批量导入（含多源插入示例模板）
 
 ## 安装
 
 ```bash
-# 克隆项目
-git clone https://github.com/gzhdev/db-migration-validator.git
+# 克隆项目（含 web submodule）
+git clone --recurse-submodules https://github.com/gzhdev/db-migration-validator.git
 cd db-migration-validator
 
 # 安装依赖（推荐使用 uv）
@@ -49,10 +49,11 @@ uv run python -m validator mapping_example.json
 uv run python -m validator mapping_example.json --master spark://localhost:7077
 ```
 
-### Web 服务器（配置生成器 + Debug 日志查看器）
+### Web 服务器（配置生成器 + Debug 日志查看器，[独立仓库](https://github.com/gzhdev/db-migration-validator-web)）
 
 ```bash
-cd web && uv run python app.py
+git submodule update --init
+cd web && uv sync && uv run python app.py
 # 访问 http://127.0.0.1:5000
 ```
 
@@ -112,11 +113,7 @@ export SOURCE_DB_PASSWORD="your_password"
 }
 ```
 
-#### Oracle (使用 python-oracledb)
-
-python-oracledb 支持两种模式：
-
-**Thin 模式（推荐）** - 纯 Python 实现，无需安装 Oracle Client：
+#### Oracle
 
 ```json
 {
@@ -129,34 +126,21 @@ python-oracledb 支持两种模式：
 }
 ```
 
-**Thick 模式** - 需要 Oracle Client，支持更多特性：
-
-```json
-{
-  "type": "oracle",
-  "host": "192.168.1.50",
-  "port": 1521,
-  "service_name": "ORCL",
-  "user": "scott",
-  "password_env": "ORACLE_PASSWORD",
-  "thick_mode": true,
-  "oracle_client": "/opt/oracle/instantclient_21_1"
-}
-```
-
 | 参数 | 说明 |
 |------|------|
 | `service_name` | Oracle 服务名（推荐） |
 | `sid` | Oracle SID（与 service_name 二选一） |
-| `thick_mode` | 是否启用 Thick 模式，默认 false |
-| `oracle_client` | Oracle Client 库路径（thick_mode=true 时） |
 
-#### SQLite
+#### SQL Server
 
 ```json
 {
-  "type": "sqlite",
-  "database": "/path/to/database.db"
+  "type": "sqlserver",
+  "host": "192.168.1.60",
+  "port": 1433,
+  "database": "mydb",
+  "user": "sa",
+  "password_env": "SQLSERVER_PASSWORD"
 }
 ```
 
@@ -195,7 +179,7 @@ python-oracledb 支持两种模式：
 }
 ```
 
-#### 2.2 多表 JOIN 模式（Spark版）
+#### 2.2 多表 JOIN 模式
 
 当目标表数据来自多张源表 JOIN 时，使用 `source_tables` 配置：
 
@@ -235,7 +219,7 @@ python-oracledb 支持两种模式：
 在多表模式下，字段使用 `alias.field` 格式引用：`"o.id"`、`"u.name"`、`"o.price * o.quantity"`。
 
 **注意事项**：
-- 多表 JOIN 模式不支持并行分区读取（仅 Spark 版）
+- 多表 JOIN 模式不支持并行分区读取
 - Oracle 数据库不支持 `AS` 别名语法，工具已自动处理
 - LEFT/FULL JOIN 可能产生 NULL 值，需正确配置 `nullable`
 - 复杂 JOIN 建议在数据库层面创建视图
@@ -296,15 +280,15 @@ python-oracledb 支持两种模式：
 | `target_field` | 是 | 目标字段名 |
 | `source_field` | 二选一 | 源字段名（与 transform 二选一） |
 | `is_primary_key` | 否 | 是否为主键，默认 false |
-| `nullable` | 否 | 是否允许空值，默认 true（Spark版取值范围校验使用） |
+| `nullable` | 否 | 是否允许空值，默认 true（取值范围校验使用） |
 | `compare_rule` | 否 | 比较规则，默认 "exact" |
 | `tolerance` | 否 | 数值容差（compare_rule=numeric_tolerance 时） |
 | `description` | 否 | 字段说明 |
-| `min_value` | 否 | 最小值（Spark版取值范围校验） |
-| `max_value` | 否 | 最大值（Spark版取值范围校验） |
-| `allowed_values` | 否 | 允许值列表（Spark版取值范围校验） |
-| `pattern` | 否 | 正则表达式（Spark版取值范围校验） |
-| `value_check_expr` | 否 | 自定义 Spark SQL 表达式（Spark版取值范围校验） |
+| `min_value` | 否 | 最小值（取值范围校验） |
+| `max_value` | 否 | 最大值（取值范围校验） |
+| `allowed_values` | 否 | 允许值列表（取值范围校验） |
+| `pattern` | 否 | 正则表达式（取值范围校验） |
+| `value_check_expr` | 否 | 自定义 Spark SQL 表达式（取值范围校验） |
 
 #### 3.2 转换映射
 
@@ -331,7 +315,7 @@ python-oracledb 支持两种模式：
 | `replace` | 字符串替换 | `fields`, `pattern`, `replacement` |
 | `constant` | 常量值 | `value` |
 | `coalesce` | 空值处理（取第一个非空） | `fields`, `default` |
-| `case` | 条件映射（CASE WHEN） | `fields`, `cases`, `else` |
+| `case` | 条件映射（CASE WHEN），支持单字段等值和多字段复合条件 | `fields`, `cases`, `else` |
 | `date_format` | 日期格式化 | `fields`, `format` |
 | `json_extract` | JSON 提取 | `fields`, `pattern` |
 | `cast` | 类型转换 | `fields`, `cast_type` |
@@ -343,7 +327,24 @@ python-oracledb 支持两种模式：
 { "type": "case", "fields": ["status"],
   "cases": [{"when": "active", "then": "1"}, {"when": "inactive", "then": "0"}],
   "else": "0" }
+```
 
+`case` 支持两种条件写法，可在同一 `cases` 数组中混用：
+
+| 写法 | 用途 | 示例 |
+|------|------|------|
+| `"when": value` | 单字段等值比较 | `{"when": "active", "then": "1"}` |
+| `"when_expr": "SQL表达式"` | 多字段复合条件（AND/OR/IS NULL 等） | `{"when_expr": "A = 0 AND B = 1", "then": "0"}` |
+
+使用 `when_expr` 时，`fields` 中仍需声明所有涉及的源字段，以确保它们被从源表 SELECT 出来：
+
+```json
+{ "type": "case", "fields": ["A", "B"],
+  "cases": [{"when_expr": "A = 0 AND B = 1", "then": "0"}],
+  "else": "1" }
+```
+
+```json
 { "type": "math", "fields": ["price", "tax", "shipping"],
   "expression": "price + tax + shipping" }
 
@@ -360,7 +361,7 @@ python-oracledb 支持两种模式：
 | `numeric_tolerance` | 数值容差比较，需配合 `tolerance` 字段 |
 | `skip` | 跳过该字段的比较 |
 
-### 6. 取值范围校验 (Spark版)
+### 6. 取值范围校验
 
 取值范围校验用于验证目标表字段值是否符合预期约束。
 
@@ -434,7 +435,7 @@ python-oracledb 支持两种模式：
 }
 ```
 
-### 9. Debug 模式（Spark版）
+### 9. Debug 模式
 
 启用 debug 模式可以记录详细的比对过程，包含**三层数据**（原始数据、期望值、目标值），便于排查数据不一致问题。
 
@@ -530,16 +531,8 @@ python-oracledb 支持两种模式：
 
 ## 命令行参数
 
-### 单机版
-
 ```bash
-uv run python validator.py <config.json> [--parallel]
-```
-
-### Spark版
-
-```bash
-uv run python validator_spark.py <config.json> [--master <spark-master>]
+uv run python -m validator <config.json> [--master <spark-master>]
 ```
 
 ---
@@ -562,7 +555,7 @@ uv run python validator_spark.py <config.json> [--master <spark-master>]
        ├── 目标有源无 → missing_in_source
        └── 都有 → 按 compare_rule 比较字段
    ↓
-4. 取值范围校验（Spark版）
+4. 取值范围校验
    ├── 检查 min_value / max_value
    ├── 检查 allowed_values
    ├── 检查 pattern 正则

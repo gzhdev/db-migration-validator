@@ -55,13 +55,13 @@ $SPARK_HOME/sbin/stop-connect-server.sh
 ```bash
 # 设置环境变量后直接运行，与普通模式命令完全相同
 export SPARK_CONNECT_URL=sc://your-spark-host:15002
-python validator_spark.py mapping_example.json
+python -m validator mapping_example.json
 ```
 
 ### 一行命令
 
 ```bash
-SPARK_CONNECT_URL=sc://your-spark-host:15002 python validator_spark.py mapping_example.json
+SPARK_CONNECT_URL=sc://your-spark-host:15002 python -m validator mapping_example.json
 ```
 
 ### 注意事项

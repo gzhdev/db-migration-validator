@@ -4,7 +4,8 @@
       "Bash(find:*)",
       "Bash(rtk git:*)",
       "Bash(uv sync:*)",
-      "Bash(uv run:*)"
+      "Bash(uv run:*)",
+      "Bash(grep -rn \"duplicate\\\\|target_table.*target_table\" /d/Codes/PycharmProjects/db-migration-validator/validator/*.py)"
     ]
   }
 }

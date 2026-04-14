@@ -31,9 +31,10 @@ uv run python -m validator mapping_example.json
 uv run python -m validator mapping_example.json --master spark://localhost:7077
 ```
 
-### Web server
+### Web server (submodule)
 ```bash
-cd web && uv run python app.py
+git submodule update --init
+cd web && uv sync && uv run python app.py
 # Serves at http://127.0.0.1:5000
 ```
 
@@ -63,7 +64,7 @@ cd web && uv run python app.py
      - Single-table: `(SELECT fields FROM table WHERE filter) AS subq`
      - Multi-table: `(SELECT alias_fields FROM table1 alias1 JOIN_TYPE table2 alias2 ON condition WHERE filters) subq`
    - Build target query
-   - Load data into DataFrame/list of dicts
+   - Load data into DataFrame
    - Apply transforms to calculate "expected values" for target fields
    - JOIN data on primary keys
    - Compare fields using configured `compare_rule`
@@ -89,14 +90,14 @@ cd web && uv run python app.py
 - `numeric_tolerance` - Allow numeric difference within `tolerance`
 - `skip` - Don't compare this field
 
-**Value Check Rules** (Spark version only - validate target field values):
+**Value Check Rules** (validate target field values):
 - `min_value` / `max_value` - Numeric range validation
 - `allowed_values` - Enum validation (list of allowed values)
 - `pattern` - Regex pattern validation
 - `value_check_expr` - Custom Spark SQL expression
 - `nullable` - If `true` (default), NULL values pass all value checks; if `false`, NULL values fail
 
-**NULL Value Handling** (important for Spark version):
+**NULL Value Handling**:
 - Spark SQL `isin()`, `rlike()`, and comparisons return `NULL` (not `TRUE`/`FALSE`) when input is `NULL`
 - The code handles this by using `col.isNull() | non_null_checks` pattern for nullable fields
 - This ensures NULL values pass validation when `nullable: true`, avoiding false positives
@@ -110,7 +111,9 @@ cd web && uv run python app.py
 - **Caching**: Persists DataFrames before triggering actions
 - **Oracle AS syntax**: Oracle doesn't support `AS` alias, handled with conditional `alias_prefix`
 
-## Web Server Architecture (`web/`)
+## Web Server Architecture (`web/` submodule)
+
+Separate repository: https://github.com/gzhdev/db-migration-validator-web.git (added as git submodule)
 
 Flask-based web application with two features:
 
@@ -175,7 +178,7 @@ Flask-based web application with two features:
 }
 ```
 
-### Multi-Table JOIN Mode (Spark version only)
+### Multi-Table JOIN Mode
 
 ```json
 {

@@ -1,27 +1,77 @@
-# Web 查看器说明
+# Web 模块说明
 
 ## 概述
 
-Web 查看器是一个基于 Flask 的本地 Web 应用，用于可视化浏览校验工具产生的 Debug 输出。支持导入多次校验运行，对异常记录进行筛选、翻页查看。
+Web 模块是一个基于 Flask 的本地 Web 应用，提供两项功能：
+
+| 功能 | 路径 | 说明 |
+|------|------|------|
+| **映射配置生成器** | `/mapping-generator` | 可视化生成校验配置文件，支持 Excel 批量导入 |
+| **Debug 日志查看器** | `/` | 导入并浏览校验运行产生的 Debug 输出 |
+
+Web 模块作为独立仓库维护，通过 git submodule 引入：https://github.com/gzhdev/db-migration-validator-web.git
 
 ---
 
-## 安装
-
-```bash
-pip install flask>=3.0.0
-```
-
 ---
 
-## 启动
+## 安装与启动
 
 ```bash
+# 拉取 submodule
+git submodule update --init
+
+# 安装依赖并启动
 cd web
-python app.py
+uv sync
+uv run python app.py
 ```
 
 默认监听 `http://127.0.0.1:5000`，浏览器打开即可使用。
+
+---
+
+## 映射配置生成器
+
+访问 `/mapping-generator`，可视化编辑并生成校验配置 JSON，无需手写配置文件。
+
+### 主要功能
+
+- **数据库连接配置**：支持 MySQL、PostgreSQL、Oracle、SQLite
+- **表映射编辑**：支持单表模式和多表 JOIN 模式，可添加任意数量的表映射条目
+- **字段映射编辑**：支持所有转换类型（concat、case、math 等）和比较规则，字段详细设置（取值范围校验）通过弹窗配置
+- **JSON 预览/下载/复制**：实时生成预览，一键下载
+- **导入已有 JSON**：上传现有配置文件，在界面中继续编辑
+- **Excel 批量导入**：上传字段映射 Excel 文件，自动生成完整配置
+
+### Excel 批量导入
+
+点击"下载 Excel 模板"获取模板文件（`mapping_template.xlsx`），包含 4 个 Sheet：
+
+| Sheet | 内容 |
+|-------|------|
+| 单表示例 | 基本的单表字段映射示例 |
+| 多表JOIN示例 | 多表 JOIN 场景示例 |
+| 多源插入示例 | 3 个条目从不同源表插入同一目标表（对应存储过程多 INSERT 场景） |
+| 填写说明 | 每列的含义、用途和填写规范 |
+
+**填写规则**：
+
+- 每个表映射的**第一行**填写 `source_table`（或 `join_tables`）和 `target_table`，后续行留空代表同一表映射的字段继续
+- 多表 JOIN 模式：`join_tables` 填 JSON 数组，`table_filters` 填 JSON 对象
+- 多个 Sheet 的数据会合并导入（"填写说明" Sheet 自动跳过）
+
+**多源插入同一目标表**（存储过程多 INSERT 场景）：
+
+在 Excel 中创建多个表映射条目，每个条目的 `target_table` 相同，但配置不同的源表和互斥的 `target_filter`：
+
+```
+条目1: source_table=table_a, target_table=target, target_filter="type='X'"
+条目2: join_tables=[...],   target_table=target, target_filter="type!='X' AND category='Y'"
+条目3: source_table=table_c, target_table=target, target_filter="type!='X' AND category!='Y'"
+```
+
+> **注意**：各条目的 `target_filter` 必须互斥且完整覆盖目标表全部行，否则会产生重复计数或静默遗漏。
 
 ---
 
@@ -173,14 +223,23 @@ DELETE /runs/<run_id>
 ## 目录结构
 
 ```
-web/
-├── app.py          # Flask 路由
-├── db.py           # SQLite 操作
-├── importer.py     # Debug 目录导入逻辑
-├── templates/      # Jinja2 模板
+web/                          # git submodule → db-migration-validator-web
+├── pyproject.toml            # uv 项目配置，依赖 flask>=3.0.0, openpyxl>=3.1.0
+├── uv.lock                   # 锁定依赖版本
+├── .python-version           # 指定 Python 版本
+├── .gitignore
+├── app.py                    # Flask 路由
+├── db.py                     # SQLite 操作
+├── importer.py               # Debug 目录导入逻辑
+├── templates/                # Jinja2 模板
 │   ├── base.html
 │   ├── index.html
 │   ├── run_detail.html
-│   └── records.html
-└── static/         # CSS / JS 静态资源
+│   ├── records.html
+│   └── mapping_generator.html
+└── static/                   # CSS / JS 静态资源
+    ├── css/style.css
+    └── js/
+        ├── app.js
+        └── mapping_generator.js
 ```

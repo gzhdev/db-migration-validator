@@ -599,22 +599,29 @@ class SparkDataValidator:
             df = df.withColumn(output_field, coalesce(*cols_to_check))
 
         elif transform_type == 'case':
-            if actual_fields:
-                actual_col = actual_fields[0][1]
-                cases = transform.get('cases', [])
-                default_value = transform.get('else')
+            cases = transform.get('cases', [])
+            default_value = transform.get('else')
 
-                case_expr = None
-                for c in cases:
-                    if case_expr is None:
-                        case_expr = when(col(actual_col) == c['when'], lit(c['then']))
-                    else:
-                        case_expr = case_expr.when(col(actual_col) == c['when'], lit(c['then']))
+            case_expr = None
+            for c in cases:
+                then_val = lit(c['then'])
+                if 'when_expr' in c:
+                    # 复合条件: {"when_expr": "A = 0 AND B = 1", "then": "0"}
+                    cond = expr(c['when_expr'])
+                elif actual_fields:
+                    # 单字段等值: {"when": "active", "then": "1"}
+                    cond = col(actual_fields[0][1]) == c['when']
+                else:
+                    continue
+                if case_expr is None:
+                    case_expr = when(cond, then_val)
+                else:
+                    case_expr = case_expr.when(cond, then_val)
 
-                if case_expr is not None:
-                    if default_value is not None:
-                        case_expr = case_expr.otherwise(lit(default_value))
-                    df = df.withColumn(output_field, case_expr)
+            if case_expr is not None:
+                if default_value is not None:
+                    case_expr = case_expr.otherwise(lit(default_value))
+                df = df.withColumn(output_field, case_expr)
 
         elif transform_type == 'cast':
             if actual_fields:
