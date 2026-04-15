@@ -36,6 +36,9 @@ class SparkDataValidator:
         self._source_props = None
         self._target_props = None
 
+        # 全局数量汇总 (多源迁移到单表时使用)
+        self.global_summary = {}
+
         # 初始化 Debug 导出器
         debug_config = mapping_config.get('global_settings', {}).get('debug', {})
         self.debug_config = DebugConfig.from_dict(debug_config)
@@ -600,7 +603,13 @@ class SparkDataValidator:
 
         elif transform_type == 'case':
             cases = transform.get('cases', [])
-            default_value = transform.get('else')
+            _else_sentinel = object()
+            default_value = transform.get('else', _else_sentinel)
+            # 兼容 else 写在 case 项内部的情况
+            if default_value is _else_sentinel:
+                for c in cases:
+                    if 'else' in c:
+                        default_value = c['else']
 
             case_expr = None
             for c in cases:
@@ -631,7 +640,7 @@ class SparkDataValidator:
                     case_expr = case_expr.when(cond, then_val)
 
             if case_expr is not None:
-                if default_value is not None:
+                if default_value is not _else_sentinel:
                     case_expr = case_expr.otherwise(lit(default_value))
                 df = df.withColumn(output_field, case_expr)
 
@@ -1116,6 +1125,55 @@ class SparkDataValidator:
         result.duration_seconds = (datetime.now() - start_time).total_seconds()
         return result
 
+    def _compute_global_summary(self) -> Dict[str, Any]:
+        """计算全局数量汇总 (多源迁移到单表时使用)"""
+        completed = [r for r in self.results if r.status == 'completed']
+        if not completed:
+            return {}
+
+        # 汇总各源表行数
+        source_details = {r.table_name: r.total_rows for r in completed}
+        total_source_rows = sum(r.total_rows for r in completed)
+
+        # 获取目标表名和连接信息
+        tables = self.config.get('tables', [])
+        if not tables:
+            return {}
+
+        first_table = tables[0]
+        target_table = first_table.get('target_table', '')
+        target_schema = first_table.get('target_schema')
+        target_db = self.config.get('target_db', {})
+        db_type = target_db.get('type', 'mysql').lower()
+
+        # 查询目标表总行数 (不带任何过滤条件)
+        try:
+            jdbc_url = self._get_jdbc_url(target_db)
+            props = self._get_jdbc_properties(target_db)
+            full_table = self._get_full_table_name(target_table, target_schema, db_type)
+            alias_prefix = "" if db_type == 'oracle' else "AS "
+            count_query = f"(SELECT COUNT(*) AS cnt FROM {full_table}) {alias_prefix}subq"
+            count_df = self.spark.read.jdbc(url=jdbc_url, table=count_query, properties=props)
+            target_total_rows = int(count_df.first()[0])
+        except Exception as e:
+            logger.warning(f"查询目标表总行数失败: {e}")
+            target_total_rows = None
+
+        diff = (target_total_rows - total_source_rows) if target_total_rows is not None else None
+
+        summary = {
+            'target_table': target_table,
+            'total_source_rows': total_source_rows,
+            'target_total_rows': target_total_rows,
+            'diff': diff,
+            'source_details': source_details,
+        }
+
+        # 日志输出
+        logger.info(f"全局数量汇总: 源表总行数={total_source_rows}, 目标表总行数={target_total_rows}, 差异={diff}")
+
+        return summary
+
     def run_validation(self) -> List[ValidationResult]:
         """运行全部校验"""
         # 启动 debug 导出
@@ -1153,6 +1211,10 @@ class SparkDataValidator:
 
         # 关闭 debug 导出
         self.debug_exporter.close()
+
+        # 全局数量汇总 (多源迁移到单表)
+        if len(tables) > 1:
+            self.global_summary = self._compute_global_summary()
 
         return self.results
 
@@ -1198,6 +1260,9 @@ class SparkDataValidator:
                 ]
             }
 
+            if self.global_summary:
+                report['global_summary'] = self.global_summary
+
             report_file = output_path / f'validation_report_{timestamp}.json'
             with open(report_file, 'w', encoding='utf-8') as f:
                 json.dump(report, f, ensure_ascii=False, indent=2)
@@ -1217,6 +1282,22 @@ class SparkDataValidator:
                 f.write(f"- 源表缺失: {sum(r.missing_in_source for r in self.results)}\n")
                 f.write(f"- 目标表缺失: {sum(r.missing_in_target for r in self.results)}\n")
                 f.write(f"- 取值范围校验失败: {sum(r.value_check_failed for r in self.results)}\n\n")
+
+                if self.global_summary:
+                    gs = self.global_summary
+                    f.write("## 全局数量对比\n\n")
+                    details = ", ".join(f"{name}: {count}" for name, count in gs['source_details'].items())
+                    f.write(f"- 源表总行数: {gs['total_source_rows']} ({details})\n")
+                    f.write(f"- 目标表总行数: {gs['target_total_rows']}\n")
+                    if gs['diff'] is not None:
+                        if gs['diff'] == 0:
+                            f.write(f"- 差异: 0\n\n")
+                        elif gs['diff'] > 0:
+                            f.write(f"- 差异: +{gs['diff']} (目标表多出)\n\n")
+                        else:
+                            f.write(f"- 差异: {gs['diff']} (目标表缺少)\n\n")
+                    else:
+                        f.write(f"- 差异: 无法计算\n\n")
 
                 f.write("## 表详情\n\n")
                 for r in self.results:
