@@ -608,13 +608,20 @@ class SparkDataValidator:
                     if 'else' in c:
                         default_value = c['else']
 
-            case_expr = None
+            # 使用 SQL CASE 字符串 + expr() 而非链式 .when().when()。
+            # 链式 Column API 会生成深度嵌套的 Column 对象树，分支数越多嵌套越深，
+            # Spark Connect 在将执行计划序列化为 protobuf 时会触发
+            # DecodeError: Error parsing message with type 'spark.connect.Expression'。
+            sql_parts = ["CASE"]
+            has_branch = False
             for c in cases:
-                then_val = lit(c['then'])
+                then_val = c.get('then')
                 if 'when_expr' in c:
                     # 复合条件: {"when_expr": "A = 0 AND B = 1", "then": "0"}
-                    # 替换字段引用为实际列名 (e.g. o.sa_dw_rang -> `O_SA_DW_RANG`)
                     when_expr_str = c['when_expr']
+                    if not when_expr_str:
+                        logger.warning(f"case 转换中 when_expr 为空，跳过该分支")
+                        continue
                     handled_keys = set()
                     for orig_field, actual_col in actual_fields:
                         when_expr_str = when_expr_str.replace(orig_field, f"`{actual_col}`")
@@ -625,21 +632,32 @@ class SparkDataValidator:
                             continue
                         if alias_field in when_expr_str:
                             when_expr_str = when_expr_str.replace(alias_field, f"`{actual_col}`")
-                    cond = expr(when_expr_str)
                 elif actual_fields:
                     # 单字段等值: {"when": "active", "then": "1"}
-                    cond = col(actual_fields[0][1]) == c['when']
+                    escaped_when = str(c['when']).replace("'", "''")
+                    when_expr_str = f"`{actual_fields[0][1]}` = '{escaped_when}'"
                 else:
                     continue
-                if case_expr is None:
-                    case_expr = when(cond, then_val)
-                else:
-                    case_expr = case_expr.when(cond, then_val)
 
-            if case_expr is not None:
+                if then_val is None:
+                    sql_parts.append(f"WHEN {when_expr_str} THEN NULL")
+                else:
+                    then_escaped = str(then_val).replace("'", "''")
+                    sql_parts.append(f"WHEN {when_expr_str} THEN '{then_escaped}'")
+                has_branch = True
+
+            if has_branch:
                 if default_value is not _else_sentinel:
-                    case_expr = case_expr.otherwise(lit(default_value))
-                df = df.withColumn(output_field, case_expr)
+                    if default_value is None:
+                        sql_parts.append("ELSE NULL")
+                    else:
+                        else_escaped = str(default_value).replace("'", "''")
+                        sql_parts.append(f"ELSE '{else_escaped}'")
+                sql_parts.append("END")
+                df = df.withColumn(output_field, expr(" ".join(sql_parts)))
+            else:
+                logger.warning(f"case 转换无有效 WHEN 分支 (fields={fields}, cases={cases})，输出列设为 NULL")
+                df = df.withColumn(output_field, lit(None).cast(StringType()))
 
         elif transform_type == 'cast':
             if actual_fields:
@@ -701,6 +719,11 @@ class SparkDataValidator:
                 transform_col = f"_transformed_{transform_type}"
                 df = df.withColumn(expected_col, col(transform_col))
                 df = df.drop(transform_col)  # 清理临时列
+
+            else:
+                # source_field 和 transform 均未配置，设为 NULL
+                logger.warning(f"字段 {fm.target_field} 未配置 source_field 或 transform，期望值设为 NULL")
+                df = df.withColumn(expected_col, lit(None).cast(StringType()))
 
         return df
 
@@ -826,12 +849,13 @@ class SparkDataValidator:
                     )
 
             # 计算所有字段是否匹配
-            cmp_cols = [col(f"_cmp_{fm.target_field}") for fm in mapping.field_mappings]
-            all_match_expr = cmp_cols[0]
-            for c in cmp_cols[1:]:
-                all_match_expr = all_match_expr & c
-
-            classified_df = classified_df.withColumn("_all_fields_match", all_match_expr)
+            # 用 SQL AND 字符串代替链式 & 操作，避免字段数多时产生深度嵌套 Column 树
+            # 触发 Spark Connect protobuf DecodeError
+            cmp_col_names = [f"`_cmp_{fm.target_field}`" for fm in mapping.field_mappings]
+            classified_df = classified_df.withColumn(
+                "_all_fields_match",
+                expr(" AND ".join(cmp_col_names))
+            )
 
             # 缓存 classified_df，后续多次 collect 不会重复执行 FULL JOIN
             try:
@@ -886,12 +910,12 @@ class SparkDataValidator:
                     classified_df = classified_df.withColumn(check_col, check_expr)
 
                 # 计算取值范围校验结果
-                value_check_cols = [col(f"_value_check_{fm.target_field}") for fm in value_check_fields]
-                all_value_check_expr = value_check_cols[0]
-                for c in value_check_cols[1:]:
-                    all_value_check_expr = all_value_check_expr & c
-
-                classified_df = classified_df.withColumn("_value_check_passed", all_value_check_expr)
+                # 同上，用 SQL AND 字符串避免深度嵌套
+                value_check_col_names = [f"`_value_check_{fm.target_field}`" for fm in value_check_fields]
+                classified_df = classified_df.withColumn(
+                    "_value_check_passed",
+                    expr(" AND ".join(value_check_col_names))
+                )
 
                 # 统计取值范围校验失败数（仅统计目标表存在的记录）
                 value_check_stats = classified_df.filter(col("_match_type") != "missing_in_target").agg(
@@ -1279,11 +1303,11 @@ class SparkDataValidator:
                     classified_df = classified_df.withColumn(
                         result_col, col(expected_col_name).eqNullSafe(col(actual_col_name)))
 
-            cmp_cols = [col(f"_cmp_{fm.target_field}") for fm in ref_mapping.field_mappings]
-            all_match_expr = cmp_cols[0]
-            for c in cmp_cols[1:]:
-                all_match_expr = all_match_expr & c
-            classified_df = classified_df.withColumn("_all_fields_match", all_match_expr)
+            cmp_col_names = [f"`_cmp_{fm.target_field}`" for fm in ref_mapping.field_mappings]
+            classified_df = classified_df.withColumn(
+                "_all_fields_match",
+                expr(" AND ".join(cmp_col_names))
+            )
 
             try:
                 classified_df.persist()
@@ -1318,11 +1342,11 @@ class SparkDataValidator:
                         check_expr = col(actual_col_name).isNotNull() & non_null_check_expr
                     classified_df = classified_df.withColumn(check_col, check_expr)
 
-                value_check_cols = [col(f"_value_check_{fm.target_field}") for fm in value_check_fields]
-                all_value_check_expr = value_check_cols[0]
-                for c in value_check_cols[1:]:
-                    all_value_check_expr = all_value_check_expr & c
-                classified_df = classified_df.withColumn("_value_check_passed", all_value_check_expr)
+                value_check_col_names = [f"`_value_check_{fm.target_field}`" for fm in value_check_fields]
+                classified_df = classified_df.withColumn(
+                    "_value_check_passed",
+                    expr(" AND ".join(value_check_col_names))
+                )
 
                 value_check_stats = classified_df.filter(col("_match_type") != "missing_in_target").agg(
                     F.sum(when(~col("_value_check_passed"), 1).otherwise(0)).alias("value_check_failed")
