@@ -5,7 +5,11 @@
       "Bash(rtk git:*)",
       "Bash(uv sync:*)",
       "Bash(uv run:*)",
-      "Bash(grep -rn \"duplicate\\\\|target_table.*target_table\" /d/Codes/PycharmProjects/db-migration-validator/validator/*.py)"
+      "Bash(grep -rn \"duplicate\\\\|target_table.*target_table\" /d/Codes/PycharmProjects/db-migration-validator/validator/*.py)",
+      "mcp__playwright__browser_take_screenshot",
+      "mcp__playwright__browser_click",
+      "mcp__playwright__browser_snapshot",
+      "Bash(dir:*)"
     ]
   }
 }

@@ -68,20 +68,6 @@ def main():
             if result.missing_in_target > 0:
                 print(f"  目标表缺失: {result.missing_in_target}")
 
-        if validator.global_summary:
-            gs = validator.global_summary
-            print("\n=== 全局数量对比 ===")
-            details = ", ".join(f"{name}: {count}" for name, count in gs['source_details'].items())
-            print(f"源表总行数: {gs['total_source_rows']} ({details})")
-            print(f"目标表总行数: {gs['target_total_rows']}")
-            if gs['diff'] is not None:
-                if gs['diff'] == 0:
-                    print("差异: 0")
-                elif gs['diff'] > 0:
-                    print(f"差异: +{gs['diff']} (目标表多出)")
-                else:
-                    print(f"差异: {gs['diff']} (目标表缺少)")
-
         print("\n校验完成！")
 
     finally:

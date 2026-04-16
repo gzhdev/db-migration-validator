@@ -54,3 +54,6 @@ logs/
 
 # Web viewer database
 web/debug_viewer.db
+
+.playwright-mcp/
+.claude/skills/

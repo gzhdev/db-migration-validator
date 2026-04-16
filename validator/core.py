@@ -36,9 +36,6 @@ class SparkDataValidator:
         self._source_props = None
         self._target_props = None
 
-        # 全局数量汇总 (多源迁移到单表时使用)
-        self.global_summary = {}
-
         # 初始化 Debug 导出器
         debug_config = mapping_config.get('global_settings', {}).get('debug', {})
         self.debug_config = DebugConfig.from_dict(debug_config)
@@ -1125,54 +1122,374 @@ class SparkDataValidator:
         result.duration_seconds = (datetime.now() - start_time).total_seconds()
         return result
 
-    def _compute_global_summary(self) -> Dict[str, Any]:
-        """计算全局数量汇总 (多源迁移到单表时使用)"""
-        completed = [r for r in self.results if r.status == 'completed']
-        if not completed:
-            return {}
+    def validate_merged_tables(self, mappings: List[TableMapping]) -> ValidationResult:
+        """合并多个源表后与目标表统一校验 (UNION ALL + FULL OUTER JOIN)"""
+        # 使用第一个 mapping 作为参考 (字段映射、比较规则、PK 等)
+        ref_mapping = mappings[0]
 
-        # 汇总各源表行数
-        source_details = {r.table_name: r.total_rows for r in completed}
-        total_source_rows = sum(r.total_rows for r in completed)
+        # 构建源表描述
+        source_descs = []
+        for m in mappings:
+            if m.is_multi_source():
+                source_descs.append("JOIN(" + ",".join(st.alias for st in m.source_tables) + ")")
+            else:
+                source_descs.append(m.source_table or "unknown")
 
-        # 获取目标表名和连接信息
-        tables = self.config.get('tables', [])
-        if not tables:
-            return {}
+        result = ValidationResult(
+            table_name=f"UNION({', '.join(source_descs)}) -> {ref_mapping.target_table}"
+        )
+        start_time = datetime.now()
 
-        first_table = tables[0]
-        target_table = first_table.get('target_table', '')
-        target_schema = first_table.get('target_schema')
-        target_db = self.config.get('target_db', {})
-        db_type = target_db.get('type', 'mysql').lower()
+        # 开始 debug 导出
+        if self.debug_config.enabled:
+            self.debug_exporter.start_table(result.table_name, ref_mapping)
 
-        # 查询目标表总行数 (不带任何过滤条件)
+        _persisted = []
+
         try:
-            jdbc_url = self._get_jdbc_url(target_db)
-            props = self._get_jdbc_properties(target_db)
-            full_table = self._get_full_table_name(target_table, target_schema, db_type)
-            alias_prefix = "" if db_type == 'oracle' else "AS "
-            count_query = f"(SELECT COUNT(*) AS cnt FROM {full_table}) {alias_prefix}subq"
-            count_df = self.spark.read.jdbc(url=jdbc_url, table=count_query, properties=props)
-            target_total_rows = int(count_df.first()[0])
+            # 获取主键字段和期望值列名
+            pk_fields = [fm.target_field for fm in ref_mapping.field_mappings if fm.is_primary_key]
+            if not pk_fields:
+                logger.warning("没有配置主键，使用全部字段")
+                pk_fields = [fm.target_field for fm in ref_mapping.field_mappings]
+
+            expected_col_names = [f"_expected_{fm.target_field}" for fm in ref_mapping.field_mappings]
+
+            # ========== 加载所有源表并 UNION ==========
+            source_dfs = []
+            all_raw_columns = set()  # 收集所有源表的原始列名 (用于 debug 导出)
+            merged_field_alias_map = {}  # 合并所有 field_alias_map
+
+            for i, mapping in enumerate(mappings):
+                desc = source_descs[i]
+                logger.info(f"读取源表 [{i + 1}/{len(mappings)}]: {desc}")
+                source_df, field_alias_map = self.read_source_table(mapping)
+                merged_field_alias_map.update(field_alias_map)
+
+                # 保存原始列名 (不含内部列)
+                raw_cols = [c for c in source_df.columns if not c.startswith('_')]
+                all_raw_columns.update(raw_cols)
+
+                source_with_expected = self.build_source_df(source_df, mapping, field_alias_map)
+
+                # 保留 _expected_* 列 + 原始源列用于 UNION
+                select_cols = []
+                for col_name in expected_col_names:
+                    if col_name in source_with_expected.columns:
+                        select_cols.append(col(col_name))
+                    else:
+                        select_cols.append(lit(None).alias(col_name))
+                # 原始源列：各源表列名不同，用全集并补 NULL
+                for raw_col in sorted(all_raw_columns):
+                    if raw_col in source_with_expected.columns:
+                        select_cols.append(col(raw_col))
+                    else:
+                        select_cols.append(lit(None).alias(raw_col))
+                source_dfs.append(source_with_expected.select(*select_cols))
+
+            # 回补：前面的 DF 可能缺少后面源表才有的列，需要重新对齐
+            all_raw_sorted = sorted(all_raw_columns)
+            union_col_names = expected_col_names + all_raw_sorted
+            aligned_dfs = []
+            for df in source_dfs:
+                select_cols = []
+                for col_name in union_col_names:
+                    if col_name in df.columns:
+                        select_cols.append(col(col_name))
+                    else:
+                        select_cols.append(lit(None).alias(col_name))
+                aligned_dfs.append(df.select(*select_cols))
+
+            # UNION ALL
+            merged_source = aligned_dfs[0]
+            for df in aligned_dfs[1:]:
+                merged_source = merged_source.unionAll(df)
+
+            # 构建源端主键列
+            source_pk_cols = [col(f"_expected_{f}") for f in pk_fields]
+            merged_source = merged_source.withColumn("_source_pk", F.struct(*source_pk_cols))
+
+            # ========== 读取目标表 (不带 target_filter，取全量) ==========
+            logger.info(f"读取目标表: {ref_mapping.target_table}")
+            target_mapping_no_filter = TableMapping(
+                target_table=ref_mapping.target_table,
+                target_schema=ref_mapping.target_schema,
+                field_mappings=ref_mapping.field_mappings,
+                batch_size=ref_mapping.batch_size,
+            )
+            target_df = self.read_target_table(target_mapping_no_filter)
+
+            target_pk_cols = [col(f) for f in pk_fields]
+            target_df = target_df.withColumn("_target_pk", F.struct(*target_pk_cols))
+
+            # 为 target 每个字段添加 _target_* 专用列 (避免 join 后列名歧义)
+            for _fm in ref_mapping.field_mappings:
+                target_df = target_df.withColumn(f"_target_{_fm.target_field}", col(_fm.target_field))
+
+            # 缓存
+            try:
+                merged_source.persist()
+                target_df.persist()
+                _persisted = [merged_source, target_df]
+            except Exception as persist_err:
+                logger.warning(f"persist() 不可用: {persist_err}")
+
+            source_count = merged_source.count()
+            result.total_rows = source_count
+            logger.info(f"源表合并后记录数: {source_count}")
+
+            # ========== FULL OUTER JOIN ==========
+            joined_df = merged_source.alias("s").join(
+                target_df.alias("t"),
+                col("s._source_pk") == col("t._target_pk"),
+                "full_outer"
+            )
+
+            classified_df = joined_df.withColumn(
+                "_match_type",
+                when(col("s._source_pk").isNull(), "missing_in_source")
+                .when(col("t._target_pk").isNull(), "missing_in_target")
+                .otherwise("matched")
+            )
+
+            # ========== 字段比较 ==========
+            for fm in ref_mapping.field_mappings:
+                expected_col_name = f"s._expected_{fm.target_field}"
+                actual_col_name = f"t.{fm.target_field}"
+                result_col = f"_cmp_{fm.target_field}"
+
+                if fm.compare_rule == 'skip':
+                    classified_df = classified_df.withColumn(result_col, lit(True))
+                elif fm.compare_rule == 'exact':
+                    classified_df = classified_df.withColumn(
+                        result_col, col(expected_col_name).eqNullSafe(col(actual_col_name)))
+                elif fm.compare_rule == 'ignore_case':
+                    classified_df = classified_df.withColumn(
+                        result_col, lower(col(expected_col_name)).eqNullSafe(lower(col(actual_col_name))))
+                elif fm.compare_rule == 'ignore_whitespace':
+                    classified_df = classified_df.withColumn(
+                        result_col,
+                        F.regexp_replace(col(expected_col_name), r'\s+', '').eqNullSafe(
+                            F.regexp_replace(col(actual_col_name), r'\s+', '')))
+                elif fm.compare_rule == 'numeric_tolerance':
+                    tol = fm.tolerance or 0.0
+                    classified_df = classified_df.withColumn(
+                        result_col, F.abs(col(expected_col_name) - col(actual_col_name)) <= tol)
+                else:
+                    classified_df = classified_df.withColumn(
+                        result_col, col(expected_col_name).eqNullSafe(col(actual_col_name)))
+
+            cmp_cols = [col(f"_cmp_{fm.target_field}") for fm in ref_mapping.field_mappings]
+            all_match_expr = cmp_cols[0]
+            for c in cmp_cols[1:]:
+                all_match_expr = all_match_expr & c
+            classified_df = classified_df.withColumn("_all_fields_match", all_match_expr)
+
+            try:
+                classified_df.persist()
+                _persisted.append(classified_df)
+            except Exception:
+                pass
+
+            # ========== 取值范围校验 ==========
+            value_check_fields = [fm for fm in ref_mapping.field_mappings
+                                  if any([fm.min_value is not None, fm.max_value is not None,
+                                          fm.allowed_values, fm.pattern, fm.value_check_expr])]
+
+            if value_check_fields:
+                for fm in value_check_fields:
+                    check_col = f"_value_check_{fm.target_field}"
+                    actual_col_name = f"t.{fm.target_field}"
+                    non_null_check_expr = lit(True)
+                    if fm.min_value is not None:
+                        non_null_check_expr = non_null_check_expr & (col(actual_col_name) >= fm.min_value)
+                    if fm.max_value is not None:
+                        non_null_check_expr = non_null_check_expr & (col(actual_col_name) <= fm.max_value)
+                    if fm.allowed_values:
+                        non_null_check_expr = non_null_check_expr & col(actual_col_name).isin(fm.allowed_values)
+                    if fm.pattern:
+                        non_null_check_expr = non_null_check_expr & col(actual_col_name).rlike(fm.pattern)
+                    if fm.value_check_expr:
+                        custom_expr = fm.value_check_expr.replace(fm.target_field, f"`t`.`{fm.target_field}`")
+                        non_null_check_expr = non_null_check_expr & expr(custom_expr)
+                    if fm.nullable:
+                        check_expr = col(actual_col_name).isNull() | non_null_check_expr
+                    else:
+                        check_expr = col(actual_col_name).isNotNull() & non_null_check_expr
+                    classified_df = classified_df.withColumn(check_col, check_expr)
+
+                value_check_cols = [col(f"_value_check_{fm.target_field}") for fm in value_check_fields]
+                all_value_check_expr = value_check_cols[0]
+                for c in value_check_cols[1:]:
+                    all_value_check_expr = all_value_check_expr & c
+                classified_df = classified_df.withColumn("_value_check_passed", all_value_check_expr)
+
+                value_check_stats = classified_df.filter(col("_match_type") != "missing_in_target").agg(
+                    F.sum(when(~col("_value_check_passed"), 1).otherwise(0)).alias("value_check_failed")
+                ).first()
+                result.value_check_failed = value_check_stats["value_check_failed"] or 0
+            else:
+                classified_df = classified_df.withColumn("_value_check_passed", lit(True))
+
+            # ========== 聚合统计 ==========
+            stats = classified_df.agg(
+                F.sum(when(col("_match_type") == "missing_in_source", 1).otherwise(0)).alias("missing_in_source"),
+                F.sum(when(col("_match_type") == "missing_in_target", 1).otherwise(0)).alias("missing_in_target"),
+                F.sum(when((col("_match_type") == "matched") & col("_all_fields_match"), 1).otherwise(0)).alias("fully_matched"),
+                F.sum(when((col("_match_type") == "matched") & ~col("_all_fields_match"), 1).otherwise(0)).alias("mismatched")
+            ).first()
+
+            result.missing_in_source = stats["missing_in_source"] or 0
+            result.missing_in_target = stats["missing_in_target"] or 0
+            result.matched_rows = stats["fully_matched"] or 0
+            result.mismatched_rows = stats["mismatched"] or 0
+
+            logger.info(f"匹配: {result.matched_rows}, 不匹配: {result.mismatched_rows}, "
+                       f"源缺失: {result.missing_in_source}, 目标缺失: {result.missing_in_target}")
+
+            # ========== Debug 导出 ==========
+            if self.debug_config.enabled:
+                debug_filter = None
+                if self.debug_config.include_matched and result.matched_rows > 0:
+                    debug_filter = (col("_match_type") == "matched") & col("_all_fields_match")
+                if self.debug_config.include_mismatched and result.mismatched_rows > 0:
+                    cond = (col("_match_type") == "matched") & ~col("_all_fields_match")
+                    debug_filter = cond if debug_filter is None else debug_filter | cond
+                if self.debug_config.include_missing and result.missing_in_target > 0:
+                    cond = col("_match_type") == "missing_in_target"
+                    debug_filter = cond if debug_filter is None else debug_filter | cond
+                if self.debug_config.include_missing and result.missing_in_source > 0:
+                    cond = col("_match_type") == "missing_in_source"
+                    debug_filter = cond if debug_filter is None else debug_filter | cond
+                if self.debug_config.include_value_check_failed and result.value_check_failed > 0:
+                    cond = (col("_match_type") != "missing_in_target") & ~col("_value_check_passed")
+                    debug_filter = cond if debug_filter is None else debug_filter | cond
+
+                if debug_filter is not None:
+                    debug_records = classified_df.filter(debug_filter).limit(self.debug_config.max_records).collect()
+                    for row in debug_records:
+                        self.debug_exporter.export_record(
+                            row, ref_mapping, merged_field_alias_map, all_raw_sorted, value_check_fields
+                        )
+
+            # ========== 错误样本 ==========
+            if result.missing_in_target > 0:
+                for row in classified_df.filter(col("_match_type") == "missing_in_target").limit(10).collect():
+                    result.errors.append({'type': 'missing_in_target', 'key': row['_source_pk']})
+
+            if result.missing_in_source > 0:
+                for row in classified_df.filter(col("_match_type") == "missing_in_source").limit(10).collect():
+                    result.errors.append({'type': 'missing_in_source', 'key': row['_target_pk']})
+
+            if result.mismatched_rows > 0:
+                comparable_fields = [fm for fm in ref_mapping.field_mappings if fm.source_field or fm.transform]
+                mismatch_select = [col("_source_pk")]
+                for fm in ref_mapping.field_mappings:
+                    mismatch_select.append(col(f"_cmp_{fm.target_field}"))
+                for fm in comparable_fields:
+                    mismatch_select.append(col(f"s._expected_{fm.target_field}").alias(f"_exp_{fm.target_field}"))
+                    mismatch_select.append(col(f"t.{fm.target_field}").alias(f"_act_{fm.target_field}"))
+
+                sample_errors = classified_df.filter(
+                    (col("_match_type") == "matched") & ~col("_all_fields_match")
+                ).select(*mismatch_select).limit(10).collect()
+
+                comparable_set = {fm.target_field for fm in comparable_fields}
+                for row in sample_errors:
+                    mismatched_fields = []
+                    for fm in ref_mapping.field_mappings:
+                        if row[f"_cmp_{fm.target_field}"] is False and fm.target_field in comparable_set:
+                            mismatched_fields.append({
+                                'field': fm.target_field,
+                                'expected': _fmt_value(row[f"_exp_{fm.target_field}"]),
+                                'actual': _fmt_value(row[f"_act_{fm.target_field}"])
+                            })
+                    result.errors.append({
+                        'type': 'field_mismatch',
+                        'key': row['_source_pk'],
+                        'mismatched_fields': mismatched_fields
+                    })
+
+            if result.value_check_failed > 0:
+                sample_errors = classified_df.filter(
+                    (col("_match_type") != "missing_in_target") & ~col("_value_check_passed")
+                ).limit(10).collect()
+                row_fields = sample_errors[0].__fields__ if sample_errors else []
+                for row in sample_errors:
+                    failed_checks = []
+                    for fm in value_check_fields:
+                        if not row[f"_value_check_{fm.target_field}"]:
+                            field_value = None
+                            t_col_name = f"t.{fm.target_field}"
+                            if t_col_name in row_fields:
+                                field_value = row[t_col_name]
+                            elif fm.target_field in row_fields:
+                                field_value = row[fm.target_field]
+                            check_reasons = []
+                            if field_value is None:
+                                if not fm.nullable:
+                                    check_reasons.append("字段不允许为空")
+                            else:
+                                if fm.min_value is not None and field_value < fm.min_value:
+                                    check_reasons.append(f"小于最小值 {fm.min_value}")
+                                if fm.max_value is not None and field_value > fm.max_value:
+                                    check_reasons.append(f"大于最大值 {fm.max_value}")
+                                if fm.allowed_values and field_value not in fm.allowed_values:
+                                    check_reasons.append(f"不在允许值列表中 {fm.allowed_values}")
+                                if fm.pattern and not __import__('re').match(fm.pattern, str(field_value)):
+                                    check_reasons.append(f"不匹配正则 {fm.pattern}")
+                                if fm.value_check_expr:
+                                    check_reasons.append(f"不满足条件 {fm.value_check_expr}")
+                            failed_checks.append({
+                                'field': fm.target_field,
+                                'value': _fmt_value(field_value),
+                                'reasons': check_reasons
+                            })
+                    row_fields = row.__fields__ if hasattr(row, '__fields__') else []
+                    if '_source_pk' in row_fields:
+                        key_value = row['_source_pk']
+                    elif '_target_pk' in row_fields:
+                        key_value = row['_target_pk']
+                    else:
+                        key_value = None
+                    result.errors.append({
+                        'type': 'value_check_failed',
+                        'key': key_value,
+                        'failed_checks': failed_checks
+                    })
+
+            # 清理缓存
+            for _df in _persisted:
+                try:
+                    _df.unpersist()
+                except Exception:
+                    pass
+
+            result.status = "completed"
+            logger.info(f"完成合并校验: {result.table_name}")
+
+            if self.debug_config.enabled:
+                self.debug_exporter.end_table({
+                    'total_rows': result.total_rows,
+                    'matched_rows': result.matched_rows,
+                    'mismatched_rows': result.mismatched_rows,
+                    'missing_in_source': result.missing_in_source,
+                    'missing_in_target': result.missing_in_target,
+                    'value_check_failed': result.value_check_failed
+                })
+
         except Exception as e:
-            logger.warning(f"查询目标表总行数失败: {e}")
-            target_total_rows = None
+            logger.error(f"合并校验出错: {e}", exc_info=True)
+            result.status = "error"
+            result.errors.append({'type': 'exception', 'error': str(e)})
+            for _df in _persisted:
+                try:
+                    _df.unpersist()
+                except Exception:
+                    pass
 
-        diff = (target_total_rows - total_source_rows) if target_total_rows is not None else None
-
-        summary = {
-            'target_table': target_table,
-            'total_source_rows': total_source_rows,
-            'target_total_rows': target_total_rows,
-            'diff': diff,
-            'source_details': source_details,
-        }
-
-        # 日志输出
-        logger.info(f"全局数量汇总: 源表总行数={total_source_rows}, 目标表总行数={target_total_rows}, 差异={diff}")
-
-        return summary
+        result.duration_seconds = (datetime.now() - start_time).total_seconds()
+        return result
 
     def run_validation(self) -> List[ValidationResult]:
         """运行全部校验"""
@@ -1181,40 +1498,62 @@ class SparkDataValidator:
 
         tables = self.config.get('tables', [])
 
-        for table_config in tables:
-            mapping = self.load_table_mapping(table_config)
-
-            # 验证配置
-            validation_errors = self.validate_table_mapping(mapping)
-            if validation_errors:
-                # 配置验证失败，创建错误结果
-                if mapping.is_multi_source():
-                    source_desc = "JOIN(".join(st.alias for st in mapping.source_tables) + ")"
+        if len(tables) > 1:
+            # 多源迁移到单表: 合并校验模式
+            mappings = []
+            has_error = False
+            for table_config in tables:
+                mapping = self.load_table_mapping(table_config)
+                validation_errors = self.validate_table_mapping(mapping)
+                if validation_errors:
+                    if mapping.is_multi_source():
+                        source_desc = "JOIN(".join(st.alias for st in mapping.source_tables) + ")"
+                    else:
+                        source_desc = mapping.source_table or "unknown"
+                    result = ValidationResult(
+                        table_name=f"{source_desc} -> {mapping.target_table}",
+                        status="error"
+                    )
+                    for err in validation_errors:
+                        result.errors.append({'type': 'config_validation', 'error': err})
+                        logger.error(f"配置验证失败: {err}")
+                    self.results.append(result)
+                    has_error = True
                 else:
-                    source_desc = mapping.source_table or "unknown"
+                    mappings.append(mapping)
 
-                result = ValidationResult(
-                    table_name=f"{source_desc} -> {mapping.target_table}",
-                    status="error"
-                )
-                for err in validation_errors:
-                    result.errors.append({
-                        'type': 'config_validation',
-                        'error': err
-                    })
-                    logger.error(f"配置验证失败: {err}")
+            if not has_error and mappings:
+                result = self.validate_merged_tables(mappings)
                 self.results.append(result)
-                continue
-
-            result = self.validate_table(mapping)
-            self.results.append(result)
+            elif mappings:
+                # 部分配置失败，仍然尝试合并校验通过的部分
+                logger.warning(f"部分配置验证失败，使用 {len(mappings)} 个有效映射继续合并校验")
+                result = self.validate_merged_tables(mappings)
+                self.results.append(result)
+        else:
+            # 单表模式: 逐表校验
+            for table_config in tables:
+                mapping = self.load_table_mapping(table_config)
+                validation_errors = self.validate_table_mapping(mapping)
+                if validation_errors:
+                    if mapping.is_multi_source():
+                        source_desc = "JOIN(".join(st.alias for st in mapping.source_tables) + ")"
+                    else:
+                        source_desc = mapping.source_table or "unknown"
+                    result = ValidationResult(
+                        table_name=f"{source_desc} -> {mapping.target_table}",
+                        status="error"
+                    )
+                    for err in validation_errors:
+                        result.errors.append({'type': 'config_validation', 'error': err})
+                        logger.error(f"配置验证失败: {err}")
+                    self.results.append(result)
+                    continue
+                result = self.validate_table(mapping)
+                self.results.append(result)
 
         # 关闭 debug 导出
         self.debug_exporter.close()
-
-        # 全局数量汇总 (多源迁移到单表)
-        if len(tables) > 1:
-            self.global_summary = self._compute_global_summary()
 
         return self.results
 
@@ -1260,9 +1599,6 @@ class SparkDataValidator:
                 ]
             }
 
-            if self.global_summary:
-                report['global_summary'] = self.global_summary
-
             report_file = output_path / f'validation_report_{timestamp}.json'
             with open(report_file, 'w', encoding='utf-8') as f:
                 json.dump(report, f, ensure_ascii=False, indent=2)
@@ -1282,22 +1618,6 @@ class SparkDataValidator:
                 f.write(f"- 源表缺失: {sum(r.missing_in_source for r in self.results)}\n")
                 f.write(f"- 目标表缺失: {sum(r.missing_in_target for r in self.results)}\n")
                 f.write(f"- 取值范围校验失败: {sum(r.value_check_failed for r in self.results)}\n\n")
-
-                if self.global_summary:
-                    gs = self.global_summary
-                    f.write("## 全局数量对比\n\n")
-                    details = ", ".join(f"{name}: {count}" for name, count in gs['source_details'].items())
-                    f.write(f"- 源表总行数: {gs['total_source_rows']} ({details})\n")
-                    f.write(f"- 目标表总行数: {gs['target_total_rows']}\n")
-                    if gs['diff'] is not None:
-                        if gs['diff'] == 0:
-                            f.write(f"- 差异: 0\n\n")
-                        elif gs['diff'] > 0:
-                            f.write(f"- 差异: +{gs['diff']} (目标表多出)\n\n")
-                        else:
-                            f.write(f"- 差异: {gs['diff']} (目标表缺少)\n\n")
-                    else:
-                        f.write(f"- 差异: 无法计算\n\n")
 
                 f.write("## 表详情\n\n")
                 for r in self.results:
